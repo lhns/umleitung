@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 
@@ -132,6 +133,7 @@ func newReconciler(t *testing.T, srcEP, dstEP config.Endpoint, store *state.Stor
 		t.Fatal(err)
 	}
 	rec := reconcile.New(store, src, dst, reconcile.Options{
+		DestFolder: dstEP.Folder,
 		UIDBatch:  2, // tiny windows so the test exercises windowing
 		DestGuard: true,
 		CarrySeen: true,
@@ -354,6 +356,7 @@ func TestLabelSyncEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := reconcile.New(store, src, dst, reconcile.Options{
+		DestFolder: dstEP.Folder,
 		UIDBatch:     2,
 		DestGuard:    true,
 		SyncLabels:   true,
@@ -437,6 +440,384 @@ func TestLabelSyncEndToEnd(t *testing.T) {
 	got = keywordsByMID()
 	if want := []string{"work"}; !slices.Equal(got["<m4@test>"], want) {
 		t.Fatalf("m4 keywords = %v, want %v", got["<m4@test>"], want)
+	}
+}
+
+// expungeByMessageID removes a message from a source folder over raw IMAP
+// (simulating the user archiving / unlabeling in their mail client).
+func expungeByMessageID(t *testing.T, ep config.Endpoint, folder, mid string) {
+	t.Helper()
+	c, err := imapclient.DialInsecure(ep.Addr(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Login(ep.User, ep.Password).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Select(folder, nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := c.UIDSearch(&imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: mid}},
+	}, nil).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	uids := data.AllUIDs()
+	if len(uids) == 0 {
+		t.Fatalf("expunge setup: %q not found in %q", mid, folder)
+	}
+	if err := c.Store(imap.UIDSetNum(uids...), &imap.StoreFlags{
+		Op: imap.StoreFlagsAdd, Silent: true, Flags: []imap.Flag{imap.FlagDeleted},
+	}, nil).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Expunge().Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// midsIn returns the set of Message-IDs currently in a destination folder.
+func midsIn(t *testing.T, ep config.Endpoint, folder string) map[string]bool {
+	t.Helper()
+	fep := ep
+	fep.Folder = folder
+	out := map[string]bool{}
+	for _, m := range destMessages(t, fep) {
+		out[m.MessageID] = true
+	}
+	return out
+}
+
+func TestArchiveRoutingEndToEnd(t *testing.T) {
+	const (
+		destInbox   = "Mirror"
+		destArchive = "MirrorArchive"
+	)
+	srcEP, srcUser := startServer(t, "source@test")
+	dstEP, _ := startServer(t, "dest@test")
+	srcEP.Folder = srcFolder
+	dstEP.Folder = destInbox
+
+	for _, f := range []string{srcFolder, "INBOX"} {
+		if err := srcUser.Create(f, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	baseDate := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	appendTo := func(folder string, raw []byte, date time.Time) {
+		ep := srcEP
+		ep.Folder = folder
+		appendToSource(t, ep, raw, date)
+	}
+	m1 := rawMessage("<m1@test>", "in inbox")
+	m2 := rawMessage("<m2@test>", "archived")
+	m3 := rawMessage("<m3@test>", "sent-only")
+	appendTo(srcFolder, m1, baseDate)
+	appendTo(srcFolder, m2, baseDate.Add(time.Minute))
+	appendTo(srcFolder, m3, baseDate.Add(2*time.Minute))
+	appendTo("INBOX", m1, baseDate)
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	src, err := imapx.Dial(srcEP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst, err := imapx.Dial(dstEP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	for _, f := range []string{destInbox, destArchive} {
+		if err := dst.EnsureNamedFolder(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, _, err := dst.SelectFolder(); err != nil {
+		t.Fatal(err)
+	}
+	rec := reconcile.New(store, src, dst, reconcile.Options{
+		UIDBatch:       2,
+		DestGuard:      true,
+		DestFolder:     destInbox,
+		ArchiveRouting: true,
+		SourceInbox:    "INBOX",
+		ArchiveFolder:  destArchive,
+	}, slog.New(slog.DiscardHandler))
+	ctx := context.Background()
+
+	// --- Initial routing: inbox mail -> Mirror, everything else -> archive. ---
+	sum, err := rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 3 {
+		t.Fatalf("copied %d, want 3", sum.Copied)
+	}
+	inbox, archive := midsIn(t, dstEP, destInbox), midsIn(t, dstEP, destArchive)
+	if !inbox["<m1@test>"] || len(inbox) != 1 {
+		t.Fatalf("dest inbox = %v, want only m1", inbox)
+	}
+	if !archive["<m2@test>"] || !archive["<m3@test>"] || len(archive) != 2 {
+		t.Fatalf("dest archive = %v, want m2+m3", archive)
+	}
+
+	// --- User archives m1 in the source -> dest copy moves to archive. ---
+	expungeByMessageID(t, srcEP, "INBOX", "<m1@test>")
+	sum, err = rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToArchive != 1 {
+		t.Fatalf("moved_to_archive = %d, want 1 (%+v)", sum.MovedToArchive, sum)
+	}
+	inbox, archive = midsIn(t, dstEP, destInbox), midsIn(t, dstEP, destArchive)
+	if len(inbox) != 0 || len(archive) != 3 {
+		t.Fatalf("after archive: inbox=%v archive=%v", inbox, archive)
+	}
+
+	// --- User moves m2 back to the source inbox -> dest copy moves back. ---
+	appendTo("INBOX", m2, baseDate.Add(time.Minute))
+	sum, err = rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToInbox != 1 {
+		t.Fatalf("moved_to_inbox = %d, want 1 (%+v)", sum.MovedToInbox, sum)
+	}
+	inbox, archive = midsIn(t, dstEP, destInbox), midsIn(t, dstEP, destArchive)
+	if !inbox["<m2@test>"] || len(inbox) != 1 || len(archive) != 2 {
+		t.Fatalf("after unarchive: inbox=%v archive=%v", inbox, archive)
+	}
+
+	// --- Stability: re-run is a complete no-op, zero duplicates anywhere. ---
+	sum, err = rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 0 || sum.MovedToArchive != 0 || sum.MovedToInbox != 0 {
+		t.Fatalf("re-run not a no-op: %+v", sum)
+	}
+	if total := len(midsIn(t, dstEP, destInbox)) + len(midsIn(t, dstEP, destArchive)); total != 3 {
+		t.Fatalf("total dest messages = %d, want 3", total)
+	}
+}
+
+func TestLabelPropagationEndToEnd(t *testing.T) {
+	srcEP, srcUser := startServer(t, "source@test")
+	dstEP, _ := startServer(t, "dest@test")
+	srcEP.Folder = srcFolder
+	dstEP.Folder = dstFolder
+
+	for _, f := range []string{srcFolder, "Work"} {
+		if err := srcUser.Create(f, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	baseDate := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	m1 := rawMessage("<m1@test>", "one")
+	appendToSource(t, srcEP, m1, baseDate)
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	src, err := imapx.Dial(srcEP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst, err := imapx.Dial(dstEP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.EnsureFolder(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := dst.SelectFolder(); err != nil {
+		t.Fatal(err)
+	}
+	rec := reconcile.New(store, src, dst, reconcile.Options{
+		UIDBatch:       2,
+		DestGuard:      true,
+		DestFolder:     dstFolder,
+		SyncLabels:     true,
+		LabelPropagate: true,
+		SourceFolder:   srcFolder,
+	}, slog.New(slog.DiscardHandler))
+	ctx := context.Background()
+
+	destKeywords := func() []string {
+		checker, err := imapx.Dial(dstEP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer checker.Close()
+		if _, _, _, err := checker.SelectFolder(); err != nil {
+			t.Fatal(err)
+		}
+		full, err := checker.FetchFull(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kws []string
+		for _, f := range full.Flags {
+			if !strings.HasPrefix(string(f), `\`) {
+				kws = append(kws, string(f))
+			}
+		}
+		sort.Strings(kws)
+		return kws
+	}
+
+	// Mirrored unlabeled.
+	if _, err := rec.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if kws := destKeywords(); len(kws) != 0 {
+		t.Fatalf("unlabeled message has keywords %v", kws)
+	}
+
+	// User sets a manual tag on the dest copy (must never be touched).
+	if found, err := dst.StoreKeywordByMessageID(dstFolder, "<m1@test>", true, "mytag"); err != nil || !found {
+		t.Fatalf("manual tag setup: %v %v", found, err)
+	}
+
+	// Label added at the source AFTER mirroring -> keyword appears.
+	{
+		ep := srcEP
+		ep.Folder = "Work"
+		appendToSource(t, ep, m1, baseDate)
+	}
+	sum, err := rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.KeywordsUpdated != 1 {
+		t.Fatalf("keywords_updated = %d, want 1", sum.KeywordsUpdated)
+	}
+	if kws := destKeywords(); !slices.Equal(kws, []string{"mytag", "work"}) {
+		t.Fatalf("keywords = %v, want [mytag work]", kws)
+	}
+
+	// Label removed at the source -> keyword removed, manual tag preserved.
+	expungeByMessageID(t, srcEP, "Work", "<m1@test>")
+	sum, err = rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.KeywordsUpdated != 1 {
+		t.Fatalf("keywords_updated = %d, want 1", sum.KeywordsUpdated)
+	}
+	if kws := destKeywords(); !slices.Equal(kws, []string{"mytag"}) {
+		t.Fatalf("keywords = %v, want [mytag] (label keyword removed, manual tag kept)", kws)
+	}
+}
+
+// TestBackfillAfterUpgrade: mail mirrored by a version WITHOUT routing gets
+// auto-sorted when routing is enabled later.
+func TestBackfillAfterUpgrade(t *testing.T) {
+	const (
+		destInbox   = "Mirror"
+		destArchive = "MirrorArchive"
+	)
+	srcEP, srcUser := startServer(t, "source@test")
+	dstEP, _ := startServer(t, "dest@test")
+	srcEP.Folder = srcFolder
+	dstEP.Folder = destInbox
+
+	for _, f := range []string{srcFolder, "INBOX"} {
+		if err := srcUser.Create(f, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	baseDate := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	m1 := rawMessage("<m1@test>", "in inbox")
+	m2 := rawMessage("<m2@test>", "archived")
+	{
+		ep := srcEP
+		appendToSource(t, ep, m1, baseDate)
+		appendToSource(t, ep, m2, baseDate.Add(time.Minute))
+		ep.Folder = "INBOX"
+		appendToSource(t, ep, m1, baseDate)
+	}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Phase 1: no routing — everything lands in Mirror.
+	rec, closeRec := newReconciler(t, srcEP, dstEP, store)
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	closeRec()
+	if inbox := midsIn(t, dstEP, destInbox); len(inbox) != 2 {
+		t.Fatalf("pre-upgrade: Mirror has %v, want both", inbox)
+	}
+
+	// Phase 2: "upgrade" — routing enabled with the same state db.
+	src, err := imapx.Dial(srcEP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst, err := imapx.Dial(dstEP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	for _, f := range []string{destInbox, destArchive} {
+		if err := dst.EnsureNamedFolder(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec2 := reconcile.New(store, src, dst, reconcile.Options{
+		UIDBatch:       2,
+		DestGuard:      true,
+		DestFolder:     destInbox,
+		ArchiveRouting: true,
+		SourceInbox:    "INBOX",
+		ArchiveFolder:  destArchive,
+	}, slog.New(slog.DiscardHandler))
+
+	sum, err := rec2.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 0 {
+		t.Fatalf("backfill duplicated: copied %d", sum.Copied)
+	}
+	if sum.MovedToArchive != 1 {
+		t.Fatalf("moved_to_archive = %d, want 1 (%+v)", sum.MovedToArchive, sum)
+	}
+	inbox, archive := midsIn(t, dstEP, destInbox), midsIn(t, dstEP, destArchive)
+	if !inbox["<m1@test>"] || len(inbox) != 1 {
+		t.Fatalf("post-backfill inbox = %v, want only m1", inbox)
+	}
+	if !archive["<m2@test>"] || len(archive) != 1 {
+		t.Fatalf("post-backfill archive = %v, want only m2", archive)
+	}
+
+	// Third run: no-op.
+	sum, err = rec2.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 0 || sum.MovedToArchive != 0 || sum.MovedToInbox != 0 {
+		t.Fatalf("third run not a no-op: %+v", sum)
 	}
 }
 

@@ -19,6 +19,9 @@ services:
       DEST_PASSWORD_FILE: /run/secrets/umleiter_dest_password
       DEST_FOLDER: "Mirror"
       # SYNC_LABELS: "true"          # mirror label-folder membership as keywords
+      # LABEL_PROPAGATE: "true"      # apply post-copy label changes as keyword deltas
+      # ARCHIVE_ROUTING: "true"      # inbox mail -> DEST_FOLDER, archived -> DEST_ARCHIVE_FOLDER
+      # DEST_ARCHIVE_FOLDER: "Archive"
       # POLL_INTERVAL: "900"
     volumes:
       # State volume = dedup fast path. Persistent bind mount; back it up

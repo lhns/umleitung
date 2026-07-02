@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -21,15 +22,19 @@ type fakeStore struct {
 	keys        map[string]bool
 	failRecord  bool
 
-	labels       map[string]map[string]bool // dedup key -> label set
-	folderStates map[string][2]uint32       // folder -> {uidvalidity, last_uid}
+	members      map[string]map[string]uint32 // folder -> key -> uid
+	folderStates map[string][2]uint32         // folder -> {uidvalidity, last_uid}
+	pending      []PendingOp
+	nextPending  int64
+	meta         map[string]string
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		keys:         map[string]bool{},
-		labels:       map[string]map[string]bool{},
+		members:      map[string]map[string]uint32{},
 		folderStates: map[string][2]uint32{},
+		meta:         map[string]string{},
 	}
 }
 
@@ -52,21 +57,74 @@ func (s *fakeStore) SeedBatch(keys []string) error {
 	}
 	return nil
 }
-func (s *fakeStore) AddLabel(key, label string) error {
-	if s.labels[key] == nil {
-		s.labels[key] = map[string]bool{}
+func (s *fakeStore) MemberChange(folder, key string, uid uint32, add bool, pendingKind string) error {
+	if add {
+		if s.members[folder] == nil {
+			s.members[folder] = map[string]uint32{}
+		}
+		s.members[folder][key] = uid
+	} else {
+		delete(s.members[folder], key)
 	}
-	s.labels[key][label] = true
+	if pendingKind != "" {
+		op := "remove"
+		if add {
+			op = "add"
+		}
+		s.nextPending++
+		s.pending = append(s.pending, PendingOp{
+			ID: s.nextPending, Kind: pendingKind, MessageID: key, Folder: folder, Op: op,
+		})
+	}
 	return nil
 }
-func (s *fakeStore) LabelsFor(key string) ([]string, error) {
+func (s *fakeStore) MemberHas(folder, key string) (bool, error) {
+	_, ok := s.members[folder][key]
+	return ok, nil
+}
+func (s *fakeStore) MemberFolders(key string) ([]string, error) {
 	var out []string
-	for l := range s.labels[key] {
-		out = append(out, l)
+	for folder, keys := range s.members {
+		if _, ok := keys[key]; ok {
+			out = append(out, folder)
+		}
 	}
 	sort.Strings(out)
 	return out, nil
 }
+func (s *fakeStore) MemberUIDKeys(folder string) (map[uint32]string, error) {
+	out := map[uint32]string{}
+	for key, uid := range s.members[folder] {
+		if uid > 0 {
+			out[uid] = key
+		}
+	}
+	return out, nil
+}
+func (s *fakeStore) MemberKeys(folder string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for key := range s.members[folder] {
+		out[key] = true
+	}
+	return out, nil
+}
+func (s *fakeStore) PendingOps(limit int) ([]PendingOp, error) {
+	if len(s.pending) > limit {
+		return append([]PendingOp{}, s.pending[:limit]...), nil
+	}
+	return append([]PendingOp{}, s.pending...), nil
+}
+func (s *fakeStore) DeletePending(id int64) error {
+	for i, op := range s.pending {
+		if op.ID == id {
+			s.pending = append(s.pending[:i], s.pending[i+1:]...)
+			return nil
+		}
+	}
+	return nil
+}
+func (s *fakeStore) MetaGet(key string) (string, error) { return s.meta[key], nil }
+func (s *fakeStore) MetaSet(key, value string) error    { s.meta[key] = value; return nil }
 func (s *fakeStore) FolderState(name string) (uint32, uint32, error) {
 	st := s.folderStates[name]
 	return st[0], st[1], nil
@@ -159,6 +217,14 @@ func (f *fakeSource) FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, erro
 	return out, nil
 }
 
+func (f *fakeSource) SearchAllUIDs() ([]imap.UID, error) {
+	var out []imap.UID
+	for _, m := range f.selectedMsgs() {
+		out = append(out, m.meta.UID)
+	}
+	return out, nil
+}
+
 func (f *fakeSource) FetchFull(uid imap.UID) (*imapx.FullMessage, error) {
 	for _, m := range f.selectedMsgs() {
 		if m.meta.UID == uid {
@@ -168,33 +234,80 @@ func (f *fakeSource) FetchFull(uid imap.UID) (*imapx.FullMessage, error) {
 	return nil, fmt.Errorf("uid %d not found", uid)
 }
 
+const (
+	fakeDestFolder    = "DEST"
+	fakeArchiveFolder = "ARCHIVE"
+)
+
+type destMsg struct {
+	uid          uint32
+	mid          string // Message-ID ("" = none, like the real message)
+	raw          string
+	flags        []imap.Flag
+	internalDate time.Time // preserved by APPEND, like a real server
+}
+
 type fakeDest struct {
-	appended       []string     // raw bodies, in append order
+	folders map[string][]*destMsg
+	nextUID map[string]uint32
+
+	appended       []string      // raw bodies, in append order (all folders)
 	appendedFlags  [][]imap.Flag // flags per append, parallel to appended
-	messageIDs     map[string]bool
+	appendedTo     []string      // folder per append
+	moves          int
 	appendErr      error
 	rejectKeywords bool // reject any APPEND carrying non-\Seen flags
 	noArbitraryKw  bool
+	selected       string
 }
 
-func newFakeDest() *fakeDest { return &fakeDest{messageIDs: map[string]bool{}} }
+func newFakeDest() *fakeDest {
+	return &fakeDest{folders: map[string][]*destMsg{}, nextUID: map[string]uint32{}}
+}
 
-func (d *fakeDest) SelectFolder() (uint32, uint32, uint32, error) {
-	return 1, uint32(len(d.appended)) + 1, uint32(len(d.appended)), nil
+// addExisting places a message directly into a dest folder (simulating prior
+// content, e.g. the crash window or a pre-populated mailbox).
+func (d *fakeDest) addExisting(folder, mid, raw string) {
+	d.nextUID[folder]++
+	d.folders[folder] = append(d.folders[folder], &destMsg{uid: d.nextUID[folder], mid: mid, raw: raw})
+}
+
+func (d *fakeDest) total() int {
+	n := 0
+	for _, msgs := range d.folders {
+		n += len(msgs)
+	}
+	return n
+}
+
+func (d *fakeDest) inFolder(folder string) []*destMsg { return d.folders[folder] }
+
+func (d *fakeDest) SelectNamedFolder(name string) (uint32, uint32, uint32, error) {
+	d.selected = name
+	return 1, d.nextUID[name] + 1, uint32(len(d.folders[name])), nil
 }
 func (d *fakeDest) FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error) {
 	var out []imapx.MsgMeta
-	for i := range d.appended {
-		uid := imap.UID(i + 1)
-		if uid >= start && uid <= stop {
-			out = append(out, imapx.MsgMeta{UID: uid, MessageID: fmt.Sprintf("<seed-%d@x>", i+1)})
+	for _, m := range d.folders[d.selected] {
+		if imap.UID(m.uid) >= start && imap.UID(m.uid) <= stop {
+			out = append(out, imapx.MsgMeta{
+				UID: imap.UID(m.uid), MessageID: m.mid, Flags: m.flags,
+				InternalDate: m.internalDate, Size: int64(len(m.raw)),
+			})
 		}
 	}
 	return out, nil
 }
-func (d *fakeDest) HasMessageID(mid string) (bool, error) { return d.messageIDs[mid], nil }
-func (d *fakeDest) SupportsArbitraryKeywords() bool       { return !d.noArbitraryKw }
-func (d *fakeDest) Append(msg *imapx.FullMessage, flags []imap.Flag) error {
+func (d *fakeDest) HasMessageIDIn(folder, mid string) (bool, error) {
+	for _, m := range d.folders[folder] {
+		if m.mid == mid {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (d *fakeDest) SupportsArbitraryKeywords() bool { return !d.noArbitraryKw }
+func (d *fakeDest) AppendTo(folder string, msg *imapx.FullMessage, flags []imap.Flag) error {
 	if d.appendErr != nil {
 		return d.appendErr
 	}
@@ -205,12 +318,94 @@ func (d *fakeDest) Append(msg *imapx.FullMessage, flags []imap.Flag) error {
 			}
 		}
 	}
+	d.nextUID[folder]++
+	// Extract Message-ID from the raw body if the test encoded one (tests use
+	// raw bodies like "raw-a"; guard/seed tests inject via addExisting).
+	d.folders[folder] = append(d.folders[folder], &destMsg{
+		uid: d.nextUID[folder], mid: midOfRaw(string(msg.Raw)), raw: string(msg.Raw),
+		flags: flags, internalDate: msg.InternalDate,
+	})
 	d.appended = append(d.appended, string(msg.Raw))
 	d.appendedFlags = append(d.appendedFlags, flags)
+	d.appendedTo = append(d.appendedTo, folder)
+	return nil
+}
+func (d *fakeDest) MoveMessageID(fromFolder, toFolder, mid string) (bool, error) {
+	msgs := d.folders[fromFolder]
+	for i, m := range msgs {
+		if m.mid == mid {
+			d.folders[fromFolder] = append(msgs[:i], msgs[i+1:]...)
+			d.nextUID[toFolder]++
+			moved := *m
+			moved.uid = d.nextUID[toFolder]
+			d.folders[toFolder] = append(d.folders[toFolder], &moved)
+			d.moves++
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (d *fakeDest) MoveUIDs(uids []imap.UID, toFolder string) error {
+	want := map[uint32]bool{}
+	for _, u := range uids {
+		want[uint32(u)] = true
+	}
+	var keep []*destMsg
+	for _, m := range d.folders[d.selected] {
+		if want[m.uid] {
+			d.nextUID[toFolder]++
+			moved := *m
+			moved.uid = d.nextUID[toFolder]
+			d.folders[toFolder] = append(d.folders[toFolder], &moved)
+			d.moves++
+		} else {
+			keep = append(keep, m)
+		}
+	}
+	d.folders[d.selected] = keep
+	return nil
+}
+func (d *fakeDest) StoreKeywordByMessageID(folder, mid string, add bool, kw imap.Flag) (bool, error) {
+	for _, m := range d.folders[folder] {
+		if m.mid == mid {
+			if add {
+				if !slices.Contains(m.flags, kw) {
+					m.flags = append(m.flags, kw)
+				}
+			} else {
+				m.flags = slices.DeleteFunc(m.flags, func(f imap.Flag) bool { return f == kw })
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (d *fakeDest) StoreKeywordsUIDs(uids []imap.UID, kws []imap.Flag) error {
+	want := map[uint32]bool{}
+	for _, u := range uids {
+		want[uint32(u)] = true
+	}
+	for _, m := range d.folders[d.selected] {
+		if want[m.uid] {
+			for _, kw := range kws {
+				if !slices.Contains(m.flags, kw) {
+					m.flags = append(m.flags, kw)
+				}
+			}
+		}
+	}
 	return nil
 }
 
+// midOfRaw lets fakes correlate appended raw bodies back to Message-IDs: the
+// test messages are built by msg(uid, mid, raw), and the raw body encodes the
+// mid via the shared registry below.
+var rawToMid = map[string]string{}
+
+func midOfRaw(raw string) string { return rawToMid[raw] }
+
 func msg(uid uint32, mid, raw string) fakeMsg {
+	rawToMid[raw] = mid
 	return fakeMsg{
 		meta: imapx.MsgMeta{
 			UID:          imap.UID(uid),
@@ -223,6 +418,17 @@ func msg(uid uint32, mid, raw string) fakeMsg {
 }
 
 func newRec(store Store, src Source, dst Dest, opts Options) *Reconciler {
+	if opts.DestFolder == "" {
+		opts.DestFolder = fakeDestFolder
+	}
+	if opts.ArchiveRouting {
+		if opts.SourceInbox == "" {
+			opts.SourceInbox = "INBOX"
+		}
+		if opts.ArchiveFolder == "" {
+			opts.ArchiveFolder = fakeArchiveFolder
+		}
+	}
 	return New(store, src, dst, opts, slog.New(slog.DiscardHandler))
 }
 
@@ -311,7 +517,7 @@ func TestDestGuardCatchesUnrecordedAppend(t *testing.T) {
 	store := newFakeStore()
 	src := &fakeSource{uidValidity: 7, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}}
 	dst := newFakeDest()
-	dst.messageIDs["<a@x>"] = true
+	dst.addExisting(fakeDestFolder, "<a@x>", "raw-a-preexisting")
 	rec := newRec(store, src, dst, Options{DestGuard: true})
 
 	sum, err := rec.Run(context.Background())
@@ -395,7 +601,9 @@ func TestWindowedResumeAfterMidRunFailure(t *testing.T) {
 func TestSeedFromDestPreventsRecopy(t *testing.T) {
 	store := newFakeStore()
 	dst := newFakeDest()
-	dst.appended = []string{"x", "y"} // dest already holds 2 messages (seed-1, seed-2)
+	// Dest already holds 2 messages (e.g. from a prior bulk import).
+	dst.addExisting(fakeDestFolder, "<seed-1@x>", "x")
+	dst.addExisting(fakeDestFolder, "<seed-2@x>", "y")
 	src := &fakeSource{uidValidity: 7, msgs: []fakeMsg{
 		msg(1, "<seed-1@x>", "raw-1"), msg(2, "<seed-2@x>", "raw-2"), msg(3, "<new@x>", "raw-3"),
 	}}

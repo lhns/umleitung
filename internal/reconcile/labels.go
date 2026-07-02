@@ -1,8 +1,6 @@
 package reconcile
 
 import (
-	"context"
-	"fmt"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -87,64 +85,5 @@ func keywordFlags(labels []string) []imap.Flag {
 	return flags
 }
 
-// scanLabelFolders records label-folder membership (dedup key -> label) for
-// every message in every label folder, using the same windowed, resumable
-// pattern as the main mirror scan: per-folder UIDVALIDITY + last_uid
-// high-water marks committed per window.
-//
-// Must run before the main mirror pass selects the source folder (it leaves
-// a label folder selected).
-func (r *Reconciler) scanLabelFolders(ctx context.Context) error {
-	folders, err := r.src.ListFolders()
-	if err != nil {
-		return err
-	}
-	for _, f := range folders {
-		if !isLabelFolder(f, r.opts.SourceFolder, r.opts.labelExcludeSet()) {
-			continue
-		}
-		if err := r.scanOneLabelFolder(ctx, f.Name); err != nil {
-			return fmt.Errorf("label folder %q: %w", f.Name, err)
-		}
-	}
-	return nil
-}
-
-func (r *Reconciler) scanOneLabelFolder(ctx context.Context, name string) error {
-	uidValidity, uidNext, _, err := r.src.SelectNamedFolder(name)
-	if err != nil {
-		return err
-	}
-	storedValidity, lastUID, err := r.store.FolderState(name)
-	if err != nil {
-		return err
-	}
-	if storedValidity != uidValidity {
-		// Fresh or reset folder: rescan from the beginning. The labels table
-		// PK dedupes, so re-recording is harmless.
-		lastUID = 0
-	}
-	for start := lastUID + 1; start < uidNext; start += uint32(r.opts.UIDBatch) {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		stop := min(start+uint32(r.opts.UIDBatch)-1, uidNext-1)
-		metas, err := r.src.FetchMetaRange(imap.UID(start), imap.UID(stop))
-		if err != nil {
-			return fmt.Errorf("window %d:%d: %w", start, stop, err)
-		}
-		for i := range metas {
-			if err := r.store.AddLabel(DedupKey(&metas[i]), name); err != nil {
-				return err
-			}
-		}
-		if err := r.store.SetFolderState(name, uidValidity, stop); err != nil {
-			return err
-		}
-	}
-	// Handle the empty-folder / no-new-mail case: still persist UIDVALIDITY.
-	if lastUID == 0 && uidNext <= 1 {
-		return r.store.SetFolderState(name, uidValidity, 0)
-	}
-	return nil
-}
+// The membership scan itself lives in membership.go — label folders and the
+// source INBOX share one generalized, diff-based engine.

@@ -51,6 +51,11 @@ type Config struct {
 	SyncLabels   bool     // mirror source label-folder membership as dest keywords
 	LabelExclude []string // folder names excluded from the label scan
 
+	ArchiveRouting bool   // route by source-INBOX membership; propagate archive moves
+	SourceInbox    string // source folder whose membership means "in inbox"
+	ArchiveFolder  string // destination folder for archived mail
+	LabelPropagate bool   // STORE keyword changes for post-copy label changes (needs SyncLabels)
+
 	HealthAddr string // empty = disabled
 	LogLevel   string
 }
@@ -149,6 +154,10 @@ func Load() (*Config, error) {
 		CarrySeen:    boolean("CARRY_SEEN", true),
 		SyncLabels:   boolean("SYNC_LABELS", false),
 		LabelExclude: csv("LABEL_EXCLUDE"),
+		ArchiveRouting: boolean("ARCHIVE_ROUTING", false),
+		SourceInbox:    str("SOURCE_INBOX", "INBOX"),
+		ArchiveFolder:  str("DEST_ARCHIVE_FOLDER", "Archive"),
+		LabelPropagate: boolean("LABEL_PROPAGATE", false),
 		HealthAddr:   str("HEALTH_ADDR", ":8080"),
 		LogLevel:     strings.ToLower(str("LOG_LEVEL", "info")),
 	}
@@ -178,6 +187,12 @@ func Load() (*Config, error) {
 	}
 	if cfg.UIDBatch < 1 {
 		errs = append(errs, "UID_BATCH must be >= 1")
+	}
+	if cfg.LabelPropagate && !cfg.SyncLabels {
+		errs = append(errs, "LABEL_PROPAGATE requires SYNC_LABELS=true")
+	}
+	if cfg.ArchiveRouting && cfg.ArchiveFolder == cfg.Dest.Folder {
+		errs = append(errs, "DEST_ARCHIVE_FOLDER must differ from DEST_FOLDER when ARCHIVE_ROUTING is enabled")
 	}
 
 	if len(errs) > 0 {

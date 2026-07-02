@@ -17,7 +17,12 @@ import (
 	"github.com/emersion/go-imap/v2"
 
 	"github.com/lhns/umleitung/internal/imapx"
+	"github.com/lhns/umleitung/internal/state"
 )
+
+// PendingOp is a queued destination mutation; aliased from the state package
+// so store implementations and the reconciler share one type.
+type PendingOp = state.PendingOp
 
 // Store is the persistent state needed by the reconciler.
 type Store interface {
@@ -29,10 +34,17 @@ type Store interface {
 	RecordKey(key string, uid uint32, copiedAtUnix int64) error
 	CopiedCount() (int64, error)
 	SeedBatch(keys []string) error
-	AddLabel(key, label string) error
-	LabelsFor(key string) ([]string, error)
 	FolderState(name string) (uidValidity, lastUID uint32, err error)
 	SetFolderState(name string, uidValidity, lastUID uint32) error
+	MemberChange(folder, key string, uid uint32, add bool, pendingKind string) error
+	MemberHas(folder, key string) (bool, error)
+	MemberFolders(key string) ([]string, error)
+	MemberUIDKeys(folder string) (map[uint32]string, error)
+	MemberKeys(folder string) (map[string]bool, error)
+	PendingOps(limit int) ([]PendingOp, error)
+	DeletePending(id int64) error
+	MetaGet(key string) (string, error)
+	MetaSet(key, value string) error
 }
 
 // Source is the read-only side.
@@ -40,16 +52,22 @@ type Source interface {
 	SelectFolder() (uidValidity, uidNext, numMessages uint32, err error)
 	SelectNamedFolder(name string) (uidValidity, uidNext, numMessages uint32, err error)
 	ListFolders() ([]imapx.FolderInfo, error)
+	SearchAllUIDs() ([]imap.UID, error)
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
 	FetchFull(uid imap.UID) (*imapx.FullMessage, error)
 }
 
-// Dest is the append-only side.
+// Dest is the append-mostly side. The only mutations of existing messages
+// are MOVEs and keyword STOREs — content is never deleted.
 type Dest interface {
-	SelectFolder() (uidValidity, uidNext, numMessages uint32, err error)
+	SelectNamedFolder(name string) (uidValidity, uidNext, numMessages uint32, err error)
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
-	HasMessageID(messageID string) (bool, error)
-	Append(msg *imapx.FullMessage, flags []imap.Flag) error
+	HasMessageIDIn(folder, messageID string) (bool, error)
+	AppendTo(folder string, msg *imapx.FullMessage, flags []imap.Flag) error
+	MoveMessageID(fromFolder, toFolder, messageID string) (bool, error)
+	MoveUIDs(uids []imap.UID, toFolder string) error
+	StoreKeywordByMessageID(folder, messageID string, add bool, kw imap.Flag) (bool, error)
+	StoreKeywordsUIDs(uids []imap.UID, kws []imap.Flag) error
 	SupportsArbitraryKeywords() bool
 }
 
@@ -62,6 +80,12 @@ type Options struct {
 	SyncLabels   bool     // record source label-folder membership -> dest keywords
 	SourceFolder string   // the mirror source folder (excluded from label scan)
 	LabelExclude []string // additional folder names excluded from the label scan
+
+	DestFolder     string // primary destination folder
+	ArchiveRouting bool   // route by source-INBOX membership; propagate archive moves
+	SourceInbox    string // source folder whose membership means "in inbox"
+	ArchiveFolder  string // destination folder for archived mail
+	LabelPropagate bool   // STORE keyword changes for post-copy label changes
 }
 
 func (o *Options) labelExcludeSet() map[string]bool {
@@ -78,6 +102,9 @@ type Summary struct {
 	Candidates         int
 	Copied             int
 	SkippedDup         int
+	MovedToArchive     int
+	MovedToInbox       int
+	KeywordsUpdated    int
 }
 
 // Reconciler mirrors new source messages into the destination.
@@ -104,16 +131,14 @@ func New(store Store, src Source, dst Dest, opts Options, log *slog.Logger) *Rec
 func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 	sum := &Summary{}
 
-	// Label phase first, so labels are known by the time messages are
-	// appended. (Leaves a label folder selected; the SelectFolder below
-	// re-selects the mirror source folder.)
-	if r.opts.SyncLabels {
-		if !r.dst.SupportsArbitraryKeywords() {
-			r.log.Warn("destination does not advertise arbitrary keyword support (PERMANENTFLAGS \\*); labels may be dropped")
-		}
-		if err := r.scanLabelFolders(ctx); err != nil {
-			return sum, fmt.Errorf("label scan: %w", err)
-		}
+	// Membership phase first (label folders + source INBOX), so routing and
+	// copy-time keywords see current state. (Leaves some watched folder
+	// selected; the SelectFolder below re-selects the mirror source folder.)
+	if r.opts.SyncLabels && !r.dst.SupportsArbitraryKeywords() {
+		r.log.Warn("destination does not advertise arbitrary keyword support (PERMANENTFLAGS \\*); labels may be dropped")
+	}
+	if err := r.syncMembership(ctx); err != nil {
+		return sum, fmt.Errorf("membership scan: %w", err)
 	}
 
 	uidValidity, uidNext, _, err := r.src.SelectFolder()
@@ -177,11 +202,25 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 		}
 	}
 
+	// Placement/keyword backfill: auto-corrects mail mirrored before the
+	// current routing/label config was active (config fingerprint change).
+	if err := r.maybeBackfill(ctx, sum); err != nil {
+		return sum, fmt.Errorf("backfill: %w", err)
+	}
+
+	// Apply queued destination mutations (archive moves, keyword updates).
+	if r.opts.ArchiveRouting || r.opts.LabelPropagate {
+		if err := r.propagate(ctx, sum); err != nil {
+			return sum, fmt.Errorf("propagate: %w", err)
+		}
+	}
+
 	return sum, nil
 }
 
 // mirrorOne applies the three dedup layers to a single candidate and appends
-// it if — and only if — it is genuinely new.
+// it — routed to the correct destination folder — if and only if it is
+// genuinely new.
 func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 	key := DedupKey(m)
 
@@ -195,12 +234,26 @@ func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 		return nil
 	}
 
+	// Routing: inbox members -> primary folder, everything else -> archive.
+	destFolder, err := r.destFolderFor(key)
+	if err != nil {
+		return err
+	}
+
 	// Layer 3: destination guard — closes the "appended but not yet
-	// recorded" crash window by asking the destination directly.
+	// recorded" crash window by asking the destination directly. With
+	// routing, the copy may have been moved: check both folders.
 	if r.opts.DestGuard && IsRealMessageID(key) {
-		has, err := r.dst.HasMessageID(key)
+		has, err := r.dst.HasMessageIDIn(destFolder, key)
 		if err != nil {
 			return err
+		}
+		if !has {
+			if other := r.otherDestFolder(destFolder); other != "" {
+				if has, err = r.dst.HasMessageIDIn(other, key); err != nil {
+					return err
+				}
+			}
 		}
 		if has {
 			sum.SkippedDup++
@@ -217,7 +270,7 @@ func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 	flags := baseFlags
 	var keywords []imap.Flag
 	if r.opts.SyncLabels {
-		labels, err := r.store.LabelsFor(key)
+		labels, err := r.labelsFor(key)
 		if err != nil {
 			return err
 		}
@@ -226,7 +279,7 @@ func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 	}
 
 	// APPEND first, record after — never the other way around.
-	if err := r.dst.Append(full, flags); err != nil {
+	if err := r.dst.AppendTo(destFolder, full, flags); err != nil {
 		if len(keywords) == 0 {
 			return err
 		}
@@ -234,7 +287,7 @@ func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 		// keywords before treating this as an error.
 		r.log.Warn("append with label keywords failed; retrying without keywords",
 			"uid", m.UID, "keywords", len(keywords), "err", err)
-		if err := r.dst.Append(full, baseFlags); err != nil {
+		if err := r.dst.AppendTo(destFolder, full, baseFlags); err != nil {
 			return err
 		}
 	}
@@ -255,12 +308,29 @@ func safeFlags(src []imap.Flag, carrySeen bool) []imap.Flag {
 	return nil
 }
 
-// SeedFromDest streams the destination folder's dedup keys into the store in
+// SeedFromDest streams the destination folders' dedup keys into the store in
 // batches. This bootstraps idempotency against a pre-populated destination and
-// re-derives the truth after local state loss. Memory stays bounded: one
-// UID window of header metadata at a time.
+// re-derives the truth after local state loss. With archive routing enabled,
+// BOTH destination folders are scanned. Memory stays bounded: one UID window
+// of header metadata at a time.
 func (r *Reconciler) SeedFromDest(ctx context.Context) (int64, error) {
-	_, uidNext, numMessages, err := r.dst.SelectFolder()
+	folders := []string{r.opts.DestFolder}
+	if r.opts.ArchiveRouting {
+		folders = append(folders, r.opts.ArchiveFolder)
+	}
+	var seeded int64
+	for _, folder := range folders {
+		n, err := r.seedFromDestFolder(ctx, folder)
+		seeded += n
+		if err != nil {
+			return seeded, fmt.Errorf("seed %q: %w", folder, err)
+		}
+	}
+	return seeded, nil
+}
+
+func (r *Reconciler) seedFromDestFolder(ctx context.Context, folder string) (int64, error) {
+	_, uidNext, numMessages, err := r.dst.SelectNamedFolder(folder)
 	if err != nil {
 		return 0, err
 	}

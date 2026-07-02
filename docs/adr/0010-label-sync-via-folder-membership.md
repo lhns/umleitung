@@ -1,6 +1,9 @@
 # 0010 — Label sync via folder membership → IMAP keywords; categories out of scope
 
-Status: accepted
+Status: accepted, extended by [ADR 0011](0011-membership-propagation-archive-and-labels.md)
+(the copy-time-only limitation is lifted: `LABEL_PROPAGATE` applies post-copy
+label changes as keyword deltas, and the backfill applies missing keywords to
+already-mirrored mail)
 
 ## Context
 

@@ -12,35 +12,16 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS copied (
-	message_id TEXT PRIMARY KEY,
-	uid        INTEGER NOT NULL DEFAULT 0,
-	copied_at  INTEGER NOT NULL DEFAULT 0
-) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS meta (
-	key   TEXT PRIMARY KEY,
-	value TEXT NOT NULL
-) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS labels (
-	message_id TEXT NOT NULL,
-	label      TEXT NOT NULL,
-	PRIMARY KEY (message_id, label)
-) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS folders (
-	name        TEXT PRIMARY KEY,
-	uidvalidity INTEGER NOT NULL DEFAULT 0,
-	last_uid    INTEGER NOT NULL DEFAULT 0
-) WITHOUT ROWID;
-`
-
 // Store is the persistent sync state. Safe for a single process (Umleiter
 // enforces single-process via a file lock); SQLite serializes writers anyway.
 type Store struct {
 	db *sql.DB
 }
 
-// Open opens (or creates) the state database at path.
+// Open opens (or creates) the state database at path and migrates it to the
+// current schema version (see migrate.go). Databases created by older
+// versions — including ones from before the migration system existed — are
+// upgraded automatically and losslessly.
 func Open(path string) (*Store, error) {
 	// WAL for durable, non-blocking commits; busy_timeout as a safety net.
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)", path)
@@ -50,9 +31,9 @@ func Open(path string) (*Store, error) {
 	}
 	// Single connection: one writer, no lock contention with ourselves.
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	if err := migrate(db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("init state schema: %w", err)
+		return nil, fmt.Errorf("migrate state db: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -128,31 +109,144 @@ func (s *Store) CopiedCount() (int64, error) {
 	return n, err
 }
 
-// AddLabel records that the message with the given dedup key carries a label
-// (source label-folder membership). Idempotent.
-func (s *Store) AddLabel(key, label string) error {
-	_, err := s.db.Exec(`INSERT INTO labels (message_id, label) VALUES (?, ?)
-		ON CONFLICT(message_id, label) DO NOTHING`, key, label)
-	return err
+// PendingOp is a queued destination mutation (move or keyword change) that
+// must be applied exactly-once-or-retried: enqueued in the same transaction
+// as the membership change that caused it, deleted only after the
+// STORE/MOVE is confirmed (or definitively unnecessary).
+type PendingOp struct {
+	ID        int64
+	Kind      string // "move" | "keyword"
+	MessageID string // dedup key
+	Folder    string // the membership folder that changed
+	Op        string // "add" | "remove"
 }
 
-// LabelsFor returns the labels recorded for a dedup key, sorted.
-func (s *Store) LabelsFor(key string) ([]string, error) {
-	rows, err := s.db.Query(`SELECT label FROM labels WHERE message_id = ? ORDER BY label`, key)
+// MemberChange atomically updates folder membership and — when pendingKind
+// is "move" or "keyword" — enqueues the pending destination operation caused
+// by it, in ONE transaction: a delta is either fully recorded or not at all.
+func (s *Store) MemberChange(folder, key string, uid uint32, add bool, pendingKind string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if add {
+		_, err = tx.Exec(`INSERT INTO members (folder, message_id, uid) VALUES (?, ?, ?)
+			ON CONFLICT(folder, message_id) DO UPDATE SET uid = excluded.uid`, folder, key, uid)
+	} else {
+		_, err = tx.Exec(`DELETE FROM members WHERE folder = ? AND message_id = ?`, folder, key)
+	}
+	if err != nil {
+		return err
+	}
+	if pendingKind != "" {
+		op := "remove"
+		if add {
+			op = "add"
+		}
+		if _, err := tx.Exec(`INSERT INTO pending (kind, message_id, folder, op) VALUES (?, ?, ?, ?)`,
+			pendingKind, key, folder, op); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// MemberHas reports whether the message is a member of the folder.
+func (s *Store) MemberHas(folder, key string) (bool, error) {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM members WHERE folder = ? AND message_id = ?`, folder, key).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// MemberFolders returns all folders the message is a member of, sorted.
+func (s *Store) MemberFolders(key string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT folder FROM members WHERE message_id = ? ORDER BY folder`, key)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var labels []string
+	var folders []string
 	for rows.Next() {
-		var l string
-		if err := rows.Scan(&l); err != nil {
+		var f string
+		if err := rows.Scan(&f); err != nil {
 			return nil, err
 		}
-		labels = append(labels, l)
+		folders = append(folders, f)
 	}
-	return labels, rows.Err()
+	return folders, rows.Err()
 }
+
+// MemberUIDKeys returns uid -> dedup key for all members of a folder (used
+// by the membership diff; uid=0 placeholder rows from migration are skipped —
+// they are refreshed by the rebuild path).
+func (s *Store) MemberUIDKeys(folder string) (map[uint32]string, error) {
+	rows, err := s.db.Query(`SELECT uid, message_id FROM members WHERE folder = ? AND uid > 0`, folder)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[uint32]string{}
+	for rows.Next() {
+		var uid uint32
+		var key string
+		if err := rows.Scan(&uid, &key); err != nil {
+			return nil, err
+		}
+		out[uid] = key
+	}
+	return out, rows.Err()
+}
+
+// MemberKeys returns the dedup keys of all members of a folder.
+func (s *Store) MemberKeys(folder string) (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT message_id FROM members WHERE folder = ?`, folder)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		out[key] = true
+	}
+	return out, rows.Err()
+}
+
+// PendingOps returns up to limit queued destination operations, oldest first.
+func (s *Store) PendingOps(limit int) ([]PendingOp, error) {
+	rows, err := s.db.Query(`SELECT id, kind, message_id, folder, op FROM pending ORDER BY id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ops []PendingOp
+	for rows.Next() {
+		var op PendingOp
+		if err := rows.Scan(&op.ID, &op.Kind, &op.MessageID, &op.Folder, &op.Op); err != nil {
+			return nil, err
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
+// DeletePending removes a confirmed-applied pending operation.
+func (s *Store) DeletePending(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM pending WHERE id = ?`, id)
+	return err
+}
+
+// MetaGet / MetaSet expose the meta table for feature markers (e.g. the
+// placement-backfill fingerprint).
+func (s *Store) MetaGet(key string) (string, error)   { return s.metaGet(key) }
+func (s *Store) MetaSet(key, value string) error      { return s.metaSet(key, value) }
 
 // FolderState returns the per-folder UIDVALIDITY and UID high-water mark used
 // by the label scan (0, 0 if the folder was never scanned).

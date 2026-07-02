@@ -42,7 +42,8 @@ func main() {
 		"dest", cfg.Dest.Addr(), "dest_folder", cfg.Dest.Folder,
 		"poll_interval", cfg.PollInterval, "seed_dest", string(cfg.SeedDest),
 		"dest_guard", cfg.DestGuard, "uid_batch", cfg.UIDBatch,
-		"sync_labels", cfg.SyncLabels)
+		"sync_labels", cfg.SyncLabels, "archive_routing", cfg.ArchiveRouting,
+		"label_propagate", cfg.LabelPropagate)
 
 	// Cross-process guard: refuse to start if another instance holds the
 	// state volume. Two syncers would double-append.
@@ -115,19 +116,29 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 	if err := dst.EnsureFolder(); err != nil {
 		return err
 	}
-	// Keep the destination folder selected: the per-append destination guard
-	// and seeding search/fetch against it.
+	if cfg.ArchiveRouting {
+		if err := dst.EnsureNamedFolder(cfg.ArchiveFolder); err != nil {
+			return err
+		}
+	}
+	// Select the destination folder: the per-append destination guard and
+	// seeding search/fetch against it (re-selected on demand thereafter).
 	if _, _, _, err := dst.SelectFolder(); err != nil {
 		return err
 	}
 
 	rec := reconcile.New(store, src, dst, reconcile.Options{
-		UIDBatch:     cfg.UIDBatch,
-		DestGuard:    cfg.DestGuard,
-		CarrySeen:    cfg.CarrySeen,
-		SyncLabels:   cfg.SyncLabels,
-		SourceFolder: cfg.Source.Folder,
-		LabelExclude: cfg.LabelExclude,
+		UIDBatch:       cfg.UIDBatch,
+		DestGuard:      cfg.DestGuard,
+		CarrySeen:      cfg.CarrySeen,
+		SyncLabels:     cfg.SyncLabels,
+		SourceFolder:   cfg.Source.Folder,
+		LabelExclude:   cfg.LabelExclude,
+		DestFolder:     cfg.Dest.Folder,
+		ArchiveRouting: cfg.ArchiveRouting,
+		SourceInbox:    cfg.SourceInbox,
+		ArchiveFolder:  cfg.ArchiveFolder,
+		LabelPropagate: cfg.LabelPropagate,
 	}, log)
 
 	// Destination seeding: bootstrap the dedup set from what the destination
@@ -213,6 +224,8 @@ func runReconcile(ctx context.Context, rec *reconcile.Reconciler, log *slog.Logg
 	healthy.Store(time.Now().Unix())
 	log.Info("reconcile done",
 		"candidates", sum.Candidates, "copied", sum.Copied, "skipped_dupes", sum.SkippedDup,
+		"moved_to_archive", sum.MovedToArchive, "moved_to_inbox", sum.MovedToInbox,
+		"keywords_updated", sum.KeywordsUpdated,
 		"uidvalidity_changed", sum.UIDValidityChanged,
 		"took", time.Since(start).Round(time.Millisecond))
 	return nil

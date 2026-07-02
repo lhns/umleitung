@@ -18,7 +18,8 @@ import (
 	"github.com/lhns/umleitung/internal/config"
 )
 
-// MsgMeta is the cheap per-message metadata used for dedup-key computation.
+// MsgMeta is the cheap per-message metadata used for dedup-key computation
+// (and, on destination scans, for keyword backfill via Flags).
 type MsgMeta struct {
 	UID          imap.UID
 	MessageID    string // trimmed raw Message-ID header value; "" if absent
@@ -26,6 +27,7 @@ type MsgMeta struct {
 	Subject      string // raw Subject header value (used only for key synthesis)
 	InternalDate time.Time
 	Size         int64
+	Flags        []imap.Flag
 }
 
 // FullMessage is a complete message ready to be appended to the destination.
@@ -47,6 +49,9 @@ type Client struct {
 	c      *imapclient.Client
 	notify chan struct{}
 
+	// selected is the currently selected folder ("" = none yet); used to
+	// skip redundant SELECT round trips.
+	selected string
 	// arbitraryKeywords records whether the last SELECTed mailbox advertised
 	// PERMANENTFLAGS \* (arbitrary keywords storable).
 	arbitraryKeywords bool
@@ -102,15 +107,37 @@ func (cl *Client) SelectFolder() (uidValidity uint32, uidNext uint32, numMessage
 	return cl.SelectNamedFolder(cl.ep.Folder)
 }
 
-// SelectNamedFolder selects an arbitrary folder (used by the label scan) and
-// returns its UIDVALIDITY, UIDNEXT and message count.
+// SelectNamedFolder selects an arbitrary folder (used by the membership scan
+// and multi-folder destinations) and returns its UIDVALIDITY, UIDNEXT and
+// message count.
 func (cl *Client) SelectNamedFolder(name string) (uidValidity uint32, uidNext uint32, numMessages uint32, err error) {
 	data, err := cl.c.Select(name, nil).Wait()
 	if err != nil {
+		cl.selected = ""
 		return 0, 0, 0, fmt.Errorf("select %q on %s: %w", name, cl.ep.Addr(), err)
 	}
+	cl.selected = name
 	cl.arbitraryKeywords = slices.Contains(data.PermanentFlags, imap.FlagWildcard)
 	return data.UIDValidity, uint32(data.UIDNext), data.NumMessages, nil
+}
+
+// ensureSelected selects the folder only if it is not already selected.
+func (cl *Client) ensureSelected(name string) error {
+	if cl.selected == name {
+		return nil
+	}
+	_, _, _, err := cl.SelectNamedFolder(name)
+	return err
+}
+
+// SearchAllUIDs returns every UID in the currently selected folder — a cheap
+// full-membership snapshot (UIDs only, no headers).
+func (cl *Client) SearchAllUIDs() ([]imap.UID, error) {
+	data, err := cl.c.UIDSearch(&imap.SearchCriteria{}, nil).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("uid search all on %s: %w", cl.ep.Addr(), err)
+	}
+	return data.AllUIDs(), nil
 }
 
 // SupportsArbitraryKeywords reports whether the most recently selected folder
@@ -131,18 +158,21 @@ func (cl *Client) ListFolders() ([]FolderInfo, error) {
 	return folders, nil
 }
 
-// EnsureFolder creates the endpoint's folder if it does not exist yet.
-func (cl *Client) EnsureFolder() error {
-	err := cl.c.Create(cl.ep.Folder, nil).Wait()
+// EnsureFolder creates the endpoint's default folder if it does not exist yet.
+func (cl *Client) EnsureFolder() error { return cl.EnsureNamedFolder(cl.ep.Folder) }
+
+// EnsureNamedFolder creates the named folder if it does not exist yet.
+func (cl *Client) EnsureNamedFolder(name string) error {
+	err := cl.c.Create(name, nil).Wait()
 	if err == nil {
 		return nil
 	}
 	// Treat "already exists" as success; servers phrase this differently, so
 	// double-check by selecting.
-	if _, _, _, selErr := cl.SelectFolder(); selErr == nil {
+	if _, _, _, selErr := cl.SelectNamedFolder(name); selErr == nil {
 		return nil
 	}
-	return fmt.Errorf("create %q on %s: %w", cl.ep.Folder, cl.ep.Addr(), err)
+	return fmt.Errorf("create %q on %s: %w", name, cl.ep.Addr(), err)
 }
 
 var metaSection = &imap.FetchItemBodySection{
@@ -160,6 +190,7 @@ func (cl *Client) FetchMetaRange(start, stop imap.UID) ([]MsgMeta, error) {
 		UID:          true,
 		InternalDate: true,
 		RFC822Size:   true,
+		Flags:        true,
 		BodySection:  []*imap.FetchItemBodySection{metaSection},
 	}
 	cmd := cl.c.Fetch(uidSet, fetchOpts)
@@ -183,6 +214,7 @@ func (cl *Client) FetchMetaRange(start, stop imap.UID) ([]MsgMeta, error) {
 			Subject:      subject,
 			InternalDate: buf.InternalDate,
 			Size:         buf.RFC822Size,
+			Flags:        buf.Flags,
 		})
 	}
 	if err := cmd.Close(); err != nil {
@@ -233,26 +265,26 @@ func (cl *Client) FetchFull(uid imap.UID) (*FullMessage, error) {
 	return full, nil
 }
 
-// HasMessageID searches the selected folder for a Message-ID header value.
+// HasMessageID searches the currently selected folder for a Message-ID
+// header value.
 func (cl *Client) HasMessageID(messageID string) (bool, error) {
-	criteria := &imap.SearchCriteria{
-		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: messageID}},
-	}
-	data, err := cl.c.UIDSearch(criteria, nil).Wait()
-	if err != nil {
-		return false, fmt.Errorf("search Message-ID on %s: %w", cl.ep.Addr(), err)
-	}
-	return len(data.AllUIDs()) > 0, nil
+	uids, err := cl.searchMessageIDUIDs(messageID)
+	return len(uids) > 0, err
 }
 
-// Append appends a raw message to the endpoint's folder, preserving
-// INTERNALDATE and the given flags. Returns only after the server confirms.
+// Append appends a raw message to the endpoint's default folder.
 func (cl *Client) Append(msg *FullMessage, flags []imap.Flag) error {
+	return cl.AppendTo(cl.ep.Folder, msg, flags)
+}
+
+// AppendTo appends a raw message to the named folder, preserving
+// INTERNALDATE and the given flags. Returns only after the server confirms.
+func (cl *Client) AppendTo(folder string, msg *FullMessage, flags []imap.Flag) error {
 	opts := &imap.AppendOptions{Flags: flags}
 	if !msg.InternalDate.IsZero() {
 		opts.Time = msg.InternalDate
 	}
-	cmd := cl.c.Append(cl.ep.Folder, int64(len(msg.Raw)), opts)
+	cmd := cl.c.Append(folder, int64(len(msg.Raw)), opts)
 	if _, err := cmd.Write(msg.Raw); err != nil {
 		cmd.Close()
 		return fmt.Errorf("append write to %s: %w", cl.ep.Addr(), err)
@@ -261,7 +293,106 @@ func (cl *Client) Append(msg *FullMessage, flags []imap.Flag) error {
 		return fmt.Errorf("append close to %s: %w", cl.ep.Addr(), err)
 	}
 	if _, err := cmd.Wait(); err != nil {
-		return fmt.Errorf("append to %q on %s: %w", cl.ep.Folder, cl.ep.Addr(), err)
+		return fmt.Errorf("append to %q on %s: %w", folder, cl.ep.Addr(), err)
+	}
+	return nil
+}
+
+// searchMessageIDUIDs returns the UIDs matching a Message-ID header in the
+// currently selected folder.
+func (cl *Client) searchMessageIDUIDs(messageID string) ([]imap.UID, error) {
+	criteria := &imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: messageID}},
+	}
+	data, err := cl.c.UIDSearch(criteria, nil).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("search Message-ID on %s: %w", cl.ep.Addr(), err)
+	}
+	return data.AllUIDs(), nil
+}
+
+// HasMessageIDIn searches the named folder for a Message-ID header value.
+func (cl *Client) HasMessageIDIn(folder, messageID string) (bool, error) {
+	if err := cl.ensureSelected(folder); err != nil {
+		return false, err
+	}
+	uids, err := cl.searchMessageIDUIDs(messageID)
+	return len(uids) > 0, err
+}
+
+// MoveMessageID moves the message with the given Message-ID from one folder
+// to another. Returns (false, nil) when the message is not in fromFolder —
+// e.g. manually refiled by the user — which callers treat as "nothing to do".
+// go-imap falls back to COPY + STORE \Deleted + EXPUNGE on servers without
+// the MOVE capability.
+func (cl *Client) MoveMessageID(fromFolder, toFolder, messageID string) (bool, error) {
+	if err := cl.ensureSelected(fromFolder); err != nil {
+		return false, err
+	}
+	uids, err := cl.searchMessageIDUIDs(messageID)
+	if err != nil {
+		return false, err
+	}
+	if len(uids) == 0 {
+		return false, nil
+	}
+	if _, err := cl.c.Move(imap.UIDSetNum(uids...), toFolder).Wait(); err != nil {
+		return false, fmt.Errorf("move %q -> %q on %s: %w", fromFolder, toFolder, cl.ep.Addr(), err)
+	}
+	return true, nil
+}
+
+// MoveUIDs batch-moves messages by UID from the currently selected folder.
+// Used by the placement backfill; chunking is the caller's concern.
+func (cl *Client) MoveUIDs(uids []imap.UID, toFolder string) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	if _, err := cl.c.Move(imap.UIDSetNum(uids...), toFolder).Wait(); err != nil {
+		return fmt.Errorf("move %d uids to %q on %s: %w", len(uids), toFolder, cl.ep.Addr(), err)
+	}
+	cl.selected = "" // message set changed; be conservative
+	return nil
+}
+
+// StoreKeywordByMessageID adds or removes a keyword flag on the message with
+// the given Message-ID in the named folder. Returns (false, nil) when the
+// message is not found there. Idempotent (±FLAGS.SILENT).
+func (cl *Client) StoreKeywordByMessageID(folder, messageID string, add bool, kw imap.Flag) (bool, error) {
+	if err := cl.ensureSelected(folder); err != nil {
+		return false, err
+	}
+	uids, err := cl.searchMessageIDUIDs(messageID)
+	if err != nil {
+		return false, err
+	}
+	if len(uids) == 0 {
+		return false, nil
+	}
+	op := imap.StoreFlagsAdd
+	if !add {
+		op = imap.StoreFlagsDel
+	}
+	cmd := cl.c.Store(imap.UIDSetNum(uids...), &imap.StoreFlags{
+		Op: op, Silent: true, Flags: []imap.Flag{kw},
+	}, nil)
+	if err := cmd.Close(); err != nil {
+		return false, fmt.Errorf("store keyword on %s: %w", cl.ep.Addr(), err)
+	}
+	return true, nil
+}
+
+// StoreKeywordsUIDs batch-adds keyword flags to messages by UID in the
+// currently selected folder (keyword backfill).
+func (cl *Client) StoreKeywordsUIDs(uids []imap.UID, kws []imap.Flag) error {
+	if len(uids) == 0 || len(kws) == 0 {
+		return nil
+	}
+	cmd := cl.c.Store(imap.UIDSetNum(uids...), &imap.StoreFlags{
+		Op: imap.StoreFlagsAdd, Silent: true, Flags: kws,
+	}, nil)
+	if err := cmd.Close(); err != nil {
+		return fmt.Errorf("store keywords on %s: %w", cl.ep.Addr(), err)
 	}
 	return nil
 }

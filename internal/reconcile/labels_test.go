@@ -138,7 +138,7 @@ func TestLabelScanResumable(t *testing.T) {
 	if _, err := rec.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	labels, _ := store.LabelsFor("<a@x>")
+	labels, _ := store.MemberFolders("<a@x>")
 	if !slices.Equal(labels, []string{"Work"}) {
 		t.Fatalf("labels after rescan = %v, want [Work]", labels)
 	}

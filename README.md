@@ -59,6 +59,10 @@ variants pointing at a file (Docker/Swarm secrets).
 | `CARRY_SEEN` | `true` | Propagate `\Seen` from source (no other flags/keywords are ever copied) |
 | `SYNC_LABELS` | `false` | Mirror source label-folder membership as destination keywords (see below) |
 | `LABEL_EXCLUDE` | — | Comma-separated folder names to exclude from the label scan |
+| `LABEL_PROPAGATE` | `false` | Apply post-copy label changes to already-mirrored mail (±keyword deltas; requires `SYNC_LABELS`) |
+| `ARCHIVE_ROUTING` | `false` | Route by source-INBOX membership and propagate archive moves (see below) |
+| `SOURCE_INBOX` | `INBOX` | Source folder whose membership means "in inbox" |
+| `DEST_ARCHIVE_FOLDER` | `Archive` | Destination folder for archived mail; created if missing |
 | `HEALTH_ADDR` | `:8080` | `/healthz` liveness endpoint; empty disables |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
@@ -85,15 +89,56 @@ keywords** on the destination.
   are mapped like `[Werbung]` → `werbung`, `Work/Projects` → `work_projects`,
   `Bücher` → `b_cher` (lowercased — IMAP flags are case-insensitive).
   Distinct labels can collide after sanitization; harmless.
-- **Captured at copy time:** label changes made after a message was mirrored
-  are not propagated (append-only design; retroactive backfill may come
-  later).
+- **Post-copy changes propagate with `LABEL_PROPAGATE=true`:** labels
+  added/removed in the source after a message was mirrored are applied to the
+  destination copy as **deltas** (`STORE ±FLAGS` of just the changed keyword,
+  diffed against the previously recorded state) — never a full rewrite, so
+  tags you set manually in your mail client are never touched. Deltas are
+  queued transactionally and retried until the destination confirms; a crash
+  or outage never loses one.
 - **Labels never break the mirror:** if the destination rejects an APPEND
   with keywords, the message is retried once without them — the copy always
   wins over the tags.
+- **Stalwart note:** IMAP keywords *are* JMAP keywords — one per-message
+  store exposed via both protocols. Unlike Gmail labels they are flat strings
+  (no colors/hierarchy; that's client-side), don't act as folder views, and
+  are searchable (`SEARCH KEYWORD` / JMAP `hasKeyword`).
 - Excluded automatically: the source folder, `INBOX`, and special-use folders
   (Sent, Trash, Junk, All Mail, Starred, Important, Drafts, Archive). Add
   more via `LABEL_EXCLUDE=Notes,Some/Other`.
+
+## Archive routing (`ARCHIVE_ROUTING=true`, optional)
+
+There is no "archived" flag in IMAP — archiving in Gmail just removes the
+Inbox label. Umleiter derives it from folder membership: a message in the
+source folder but **not** in `SOURCE_INBOX` is archived.
+
+- **Routing:** inbox members are mirrored into `DEST_FOLDER`; everything else
+  (archived and sent-only mail) goes to `DEST_ARCHIVE_FOLDER`. The initial
+  bulk run sorts years of mail correctly from the start.
+- **Propagation:** archiving a message in the source later MOVEs its
+  destination copy `DEST_FOLDER` → `DEST_ARCHIVE_FOLDER` on the next
+  reconcile (seconds via IDLE) — and moving it back to the source inbox moves
+  it back. Moves never delete content.
+- **Upgrade auto-correction:** enabling the feature (or changing folders) on
+  an existing mirror triggers a one-time backfill that sorts already-mirrored
+  mail into the right folders (batched moves) and adds missing label
+  keywords. Idempotent and crash-safe.
+- **Manual refiling respected:** if you moved a destination copy elsewhere,
+  propagation skips it silently — the mirror never chases your moves.
+- Typical Gmail setup: `SOURCE_FOLDER=[Gmail]/All Mail`, `DEST_FOLDER=INBOX`,
+  `ARCHIVE_ROUTING=true` → your Stalwart INBOX mirrors your Gmail inbox, and
+  your Stalwart Archive holds everything you archived.
+- Caveats: mail *deleted* in the source also leaves its inbox, so its copy
+  moves to Archive (Umleiter never deletes). Messages without a `Message-ID`
+  are routed at copy time but not moved afterwards (unlocatable; rare).
+
+## State database upgrades
+
+The SQLite state database migrates automatically (`PRAGMA user_version`
+chain) — including from versions that predate the migration system. Deploy a
+new image and the schema upgrades losslessly on startup; a database created
+by a *newer* version is refused with a clear error.
 
 ## Deployment
 
@@ -168,6 +213,32 @@ stack pins `replicas: 1` — keep it that way.
   outside Gmail. See ADR 0010.
 - **Stalwart as destination:** use a Stalwart *application password* (not the
   directory/LDAP password, not OAuth).
+
+## Troubleshooting connections
+
+Umleiter retries any connection failure with exponential backoff (1s → 5min)
+and resumes exactly where it left off — a provider outage needs no action.
+To find out *whose* fault a failure is, in one minute:
+
+```sh
+# 1. Is it the app or the network/provider? Test raw TLS from the same network:
+openssl s_client -connect imap.gmail.com:993 -servername imap.gmail.com </dev/null
+# 2. Provider-side or network-side? Compare sibling endpoints:
+openssl s_client -connect smtp.gmail.com:465 </dev/null   # works?
+openssl s_client -connect pop.gmail.com:995  </dev/null   # works?
+```
+
+- All three fail → your network/DNS.
+- Only the IMAP endpoint fails (e.g. `alert decode error` / alert 50) while
+  SMTP/POP handshake fine → **provider-side fault**; nothing to fix locally,
+  Umleiter reconnects automatically when it recovers. (Observed in the wild
+  with `imap.gmail.com:993` rejecting every TLS stack while all other Google
+  endpoints worked.)
+- Only the *app* fails while `openssl` works → check `SOURCE_TLS`/ports, then
+  file a bug.
+- On container overlay networks, also consider MTU: large TLS handshakes can
+  be dropped by a mis-sized overlay (set e.g.
+  `com.docker.network.driver.mtu: 1400`).
 
 ## Edge cases (documented behavior)
 

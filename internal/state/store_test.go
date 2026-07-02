@@ -90,26 +90,61 @@ func TestRecordKeyIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestLabelsRoundTrip(t *testing.T) {
+func TestMembersRoundTrip(t *testing.T) {
 	s := openTemp(t)
-	if err := s.AddLabel("<a@x>", "Work"); err != nil {
+	if err := s.MemberChange("Work", "<a@x>", 5, true, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AddLabel("<a@x>", "Work"); err != nil {
+	// Re-add updates the uid (rescan path) without error.
+	if err := s.MemberChange("Work", "<a@x>", 6, true, ""); err != nil {
 		t.Fatalf("re-add errored: %v", err)
 	}
-	if err := s.AddLabel("<a@x>", "Friends/Close"); err != nil {
+	if err := s.MemberChange("Friends/Close", "<a@x>", 1, true, ""); err != nil {
 		t.Fatal(err)
 	}
-	labels, err := s.LabelsFor("<a@x>")
+	folders, err := s.MemberFolders("<a@x>")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(labels) != 2 || labels[0] != "Friends/Close" || labels[1] != "Work" {
-		t.Fatalf("labels = %v, want sorted [Friends/Close Work]", labels)
+	if len(folders) != 2 || folders[0] != "Friends/Close" || folders[1] != "Work" {
+		t.Fatalf("folders = %v, want sorted [Friends/Close Work]", folders)
 	}
-	if labels, _ := s.LabelsFor("<unknown@x>"); len(labels) != 0 {
-		t.Fatalf("unknown key returned labels: %v", labels)
+	if folders, _ := s.MemberFolders("<unknown@x>"); len(folders) != 0 {
+		t.Fatalf("unknown key returned folders: %v", folders)
+	}
+	uidKeys, err := s.MemberUIDKeys("Work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uidKeys) != 1 || uidKeys[6] != "<a@x>" {
+		t.Fatalf("uidKeys = %v, want {6: <a@x>}", uidKeys)
+	}
+	// Removal.
+	if err := s.MemberChange("Work", "<a@x>", 0, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if has, _ := s.MemberHas("Work", "<a@x>"); has {
+		t.Fatal("member not removed")
+	}
+}
+
+func TestMemberChangeWithPendingIsAtomic(t *testing.T) {
+	s := openTemp(t)
+	if err := s.MemberChange("Work", "<a@x>", 5, true, "keyword"); err != nil {
+		t.Fatal(err)
+	}
+	ops, err := s.PendingOps(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ops) != 1 || ops[0].Kind != "keyword" || ops[0].Op != "add" || ops[0].Folder != "Work" {
+		t.Fatalf("pending = %+v, want one keyword-add", ops)
+	}
+	if err := s.DeletePending(ops[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if ops, _ := s.PendingOps(10); len(ops) != 0 {
+		t.Fatalf("pending not drained: %+v", ops)
 	}
 }
 

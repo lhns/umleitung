@@ -1,0 +1,445 @@
+package reconcile
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"testing"
+
+	"github.com/emersion/go-imap/v2"
+)
+
+// routingSetup builds a source with an All-Mail-like main folder + INBOX,
+// where m1 is in the inbox, m2 is archived (only in main), m3 is sent-only.
+func routingSetup() (*fakeStore, *fakeSource, *fakeDest) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs: []fakeMsg{
+			msg(1, "<m1@x>", "raw-1"), // in inbox
+			msg(2, "<m2@x>", "raw-2"), // archived
+			msg(3, "<m3@x>", "raw-3"), // sent-only
+		},
+		labelFolders: map[string]*fakeLabelFolder{
+			"INBOX": {uidValidity: 70, msgs: []fakeMsg{msg(1, "<m1@x>", "raw-1")}},
+		},
+	}
+	return store, src, newFakeDest()
+}
+
+func routingOpts() Options {
+	return Options{ArchiveRouting: true, SyncLabels: false}
+}
+
+func TestArchiveRoutingAtCopyTime(t *testing.T) {
+	store, src, dst := routingSetup()
+	rec := newRec(store, src, dst, routingOpts())
+
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 3 {
+		t.Fatalf("copied %d, want 3", sum.Copied)
+	}
+	if n := len(dst.inFolder(fakeDestFolder)); n != 1 {
+		t.Fatalf("dest folder has %d, want 1 (inbox mail only)", n)
+	}
+	if n := len(dst.inFolder(fakeArchiveFolder)); n != 2 {
+		t.Fatalf("archive has %d, want 2 (archived + sent-only)", n)
+	}
+	if has, _ := dst.HasMessageIDIn(fakeDestFolder, "<m1@x>"); !has {
+		t.Fatal("inbox mail not in dest folder")
+	}
+	if has, _ := dst.HasMessageIDIn(fakeArchiveFolder, "<m2@x>"); !has {
+		t.Fatal("archived mail not in archive folder")
+	}
+}
+
+func TestArchivePropagationOut(t *testing.T) {
+	store, src, dst := routingSetup()
+	rec := newRec(store, src, dst, routingOpts())
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// User archives m1: it leaves the source INBOX.
+	src.labelFolders["INBOX"].msgs = nil
+
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToArchive != 1 {
+		t.Fatalf("moved_to_archive = %d, want 1", sum.MovedToArchive)
+	}
+	if has, _ := dst.HasMessageIDIn(fakeArchiveFolder, "<m1@x>"); !has {
+		t.Fatal("archived mail not moved to archive folder")
+	}
+	if n := len(dst.inFolder(fakeDestFolder)); n != 0 {
+		t.Fatalf("dest folder still has %d", n)
+	}
+
+	// Re-run: stable, no further moves.
+	movesBefore := dst.moves
+	sum, err = rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dst.moves != movesBefore || sum.MovedToArchive != 0 {
+		t.Fatalf("re-run performed moves: %+v", sum)
+	}
+	if dst.total() != 3 {
+		t.Fatalf("total dest messages = %d, want 3 (no dupes)", dst.total())
+	}
+}
+
+func TestArchivePropagationBackToInbox(t *testing.T) {
+	store, src, dst := routingSetup()
+	rec := newRec(store, src, dst, routingOpts())
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// User moves archived m2 back to the inbox.
+	src.labelFolders["INBOX"].msgs = append(src.labelFolders["INBOX"].msgs, msg(2, "<m2@x>", "raw-2"))
+
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToInbox != 1 {
+		t.Fatalf("moved_to_inbox = %d, want 1", sum.MovedToInbox)
+	}
+	if has, _ := dst.HasMessageIDIn(fakeDestFolder, "<m2@x>"); !has {
+		t.Fatal("un-archived mail not moved back to dest folder")
+	}
+	if dst.total() != 3 {
+		t.Fatalf("total = %d, want 3", dst.total())
+	}
+}
+
+func TestManualRefileRespected(t *testing.T) {
+	store, src, dst := routingSetup()
+	rec := newRec(store, src, dst, routingOpts())
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// User manually moved the dest copy of m1 somewhere else entirely.
+	moved, err := dst.MoveMessageID(fakeDestFolder, "Custom/Elsewhere", "<m1@x>")
+	if err != nil || !moved {
+		t.Fatal("test setup: manual refile failed")
+	}
+	movesBefore := dst.moves
+
+	// m1 is archived at the source; propagation cannot find it -> skip, no error.
+	src.labelFolders["INBOX"].msgs = nil
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToArchive != 0 || dst.moves != movesBefore {
+		t.Fatalf("propagation chased a manually refiled message: %+v", sum)
+	}
+	// The pending op must be consumed (not retried forever).
+	if ops, _ := store.PendingOps(10); len(ops) != 0 {
+		t.Fatalf("pending not drained after not-found: %+v", ops)
+	}
+}
+
+func TestSynthesizedKeySkipsPropagation(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "", "raw-nomid")}, // no Message-ID
+		labelFolders: map[string]*fakeLabelFolder{
+			"INBOX": {uidValidity: 70, msgs: []fakeMsg{msg(1, "", "raw-nomid")}},
+		},
+	}
+	dst := newFakeDest()
+	rec := newRec(store, src, dst, routingOpts())
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Copy-time routing applies (inbox member -> dest folder).
+	if n := len(dst.inFolder(fakeDestFolder)); n != 1 {
+		t.Fatalf("dest folder has %d, want 1", n)
+	}
+
+	// Archive it: no pending op may be enqueued (unlocatable on dest).
+	src.labelFolders["INBOX"].msgs = nil
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToArchive != 0 {
+		t.Fatal("synthesized-key message was propagated")
+	}
+	if ops, _ := store.PendingOps(10); len(ops) != 0 {
+		t.Fatalf("pending enqueued for synthesized key: %+v", ops)
+	}
+}
+
+func TestLabelPropagation(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: nil},
+		},
+	}
+	dst := newFakeDest()
+	rec := newRec(store, src, dst, Options{SyncLabels: true, LabelPropagate: true, SourceFolder: fakeMainFolder})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if flags := dst.inFolder(fakeDestFolder)[0].flags; len(flags) != 0 {
+		t.Fatalf("unlabeled message has flags %v", flags)
+	}
+
+	// Label added AFTER the copy -> +FLAGS on dest.
+	src.labelFolders["Work"].msgs = []fakeMsg{msg(1, "<m1@x>", "raw-1")}
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.KeywordsUpdated != 1 {
+		t.Fatalf("keywords_updated = %d, want 1", sum.KeywordsUpdated)
+	}
+	if flags := dst.inFolder(fakeDestFolder)[0].flags; !slices.Contains(flags, imap.Flag("work")) {
+		t.Fatalf("keyword not stored: %v", flags)
+	}
+
+	// Manually-set dest keyword must never be touched.
+	dst.inFolder(fakeDestFolder)[0].flags = append(dst.inFolder(fakeDestFolder)[0].flags, "mytag")
+
+	// Label removed -> -FLAGS, and only the changed keyword.
+	src.labelFolders["Work"].msgs = nil
+	sum, err = rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.KeywordsUpdated != 1 {
+		t.Fatalf("keywords_updated = %d, want 1", sum.KeywordsUpdated)
+	}
+	flags := dst.inFolder(fakeDestFolder)[0].flags
+	if slices.Contains(flags, imap.Flag("work")) {
+		t.Fatalf("removed label's keyword still present: %v", flags)
+	}
+	if !slices.Contains(flags, imap.Flag("mytag")) {
+		t.Fatalf("manually-set keyword was removed: %v", flags)
+	}
+}
+
+func TestLabelPropagationDisabledMeansNoStores(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: nil},
+		},
+	}
+	dst := newFakeDest()
+	rec := newRec(store, src, dst, Options{SyncLabels: true, LabelPropagate: false, SourceFolder: fakeMainFolder})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	src.labelFolders["Work"].msgs = []fakeMsg{msg(1, "<m1@x>", "raw-1")}
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.KeywordsUpdated != 0 {
+		t.Fatal("keywords updated despite LABEL_PROPAGATE=false")
+	}
+	if ops, _ := store.PendingOps(10); len(ops) != 0 {
+		t.Fatalf("pending enqueued despite LABEL_PROPAGATE=false: %+v", ops)
+	}
+}
+
+// The user requirement: deltas are tracked against the stored previous state
+// and survive destination failures — applied on a later run, never lost,
+// never re-applied after success.
+func TestDeltaDurabilityAcrossFailures(t *testing.T) {
+	store, src, dst := routingSetup()
+	rec := newRec(store, src, dst, routingOpts())
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// m1 leaves the inbox, but the destination is down for the propagation
+	// phase: simulate by breaking Move via a poisoned dest.
+	src.labelFolders["INBOX"].msgs = nil
+	poisoned := &failingMoveDest{fakeDest: dst}
+	recPoisoned := newRec(store, src, poisoned, routingOpts())
+	if _, err := recPoisoned.Run(context.Background()); err == nil {
+		t.Fatal("want error from failed move")
+	}
+	// The delta survives as a pending op.
+	ops, _ := store.PendingOps(10)
+	if len(ops) != 1 || ops[0].Kind != "move" || ops[0].Op != "remove" {
+		t.Fatalf("pending after failure = %+v, want one move-remove", ops)
+	}
+
+	// Next run with a healthy dest: delta applied, queue drained.
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToArchive != 1 {
+		t.Fatalf("delta not applied after recovery: %+v", sum)
+	}
+	if ops, _ := store.PendingOps(10); len(ops) != 0 {
+		t.Fatalf("queue not drained: %+v", ops)
+	}
+}
+
+type failingMoveDest struct{ *fakeDest }
+
+func (d *failingMoveDest) MoveMessageID(from, to, mid string) (bool, error) {
+	return false, fmt.Errorf("dest down (injected)")
+}
+
+func TestWatchedFolderUIDValidityReset(t *testing.T) {
+	store, src, dst := routingSetup()
+	rec := newRec(store, src, dst, routingOpts())
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	movesBefore := dst.moves
+
+	// INBOX UIDVALIDITY reset, same membership (fresh UIDs).
+	src.labelFolders["INBOX"].uidValidity = 999
+	src.labelFolders["INBOX"].msgs = []fakeMsg{msg(41, "<m1@x>", "raw-1")}
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dst.moves != movesBefore || sum.MovedToArchive != 0 || sum.MovedToInbox != 0 {
+		t.Fatalf("spurious moves after UIDVALIDITY reset: %+v", sum)
+	}
+
+	// Reset again, this time m1 really left the inbox -> detected by key diff.
+	src.labelFolders["INBOX"].uidValidity = 1000
+	src.labelFolders["INBOX"].msgs = nil
+	sum, err = rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToArchive != 1 {
+		t.Fatalf("removal across UIDVALIDITY reset missed: %+v", sum)
+	}
+}
+
+// Upgrade auto-correction: mail mirrored WITHOUT routing gets sorted into the
+// right folders when routing is enabled (placement backfill).
+func TestBackfillAfterEnablingRouting(t *testing.T) {
+	store, src, dst := routingSetup()
+
+	// Phase 1: old config — no routing, everything lands in the dest folder.
+	rec := newRec(store, src, dst, Options{})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(dst.inFolder(fakeDestFolder)); n != 3 {
+		t.Fatalf("pre-upgrade: dest folder has %d, want 3", n)
+	}
+
+	// Phase 2: upgrade — routing enabled. Backfill must move the two
+	// non-inbox messages to the archive.
+	rec = newRec(store, src, dst, routingOpts())
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToArchive != 2 {
+		t.Fatalf("backfill moved %d, want 2", sum.MovedToArchive)
+	}
+	if n := len(dst.inFolder(fakeDestFolder)); n != 1 {
+		t.Fatalf("post-backfill: dest folder has %d, want 1", n)
+	}
+	if n := len(dst.inFolder(fakeArchiveFolder)); n != 2 {
+		t.Fatalf("post-backfill: archive has %d, want 2", n)
+	}
+	if dst.total() != 3 {
+		t.Fatalf("total = %d, want 3 (no dupes)", dst.total())
+	}
+
+	// Phase 3: same config again — fingerprint stored, backfill is a no-op.
+	movesBefore := dst.moves
+	sum, err = rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dst.moves != movesBefore || sum.MovedToArchive != 0 {
+		t.Fatalf("backfill re-ran on unchanged config: %+v", sum)
+	}
+}
+
+// Keyword backfill is add-only: missing label keywords are added, but
+// keywords without a matching label (user tags / stale labels) are kept.
+func TestBackfillKeywordsAddOnly(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<m1@x>", "raw-1")}},
+		},
+	}
+	dst := newFakeDest()
+
+	// Phase 1: mirrored without label sync.
+	rec := newRec(store, src, dst, Options{SourceFolder: fakeMainFolder})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// User sets a manual tag on the dest copy in the meantime.
+	dst.inFolder(fakeDestFolder)[0].flags = append(dst.inFolder(fakeDestFolder)[0].flags, "mytag")
+
+	// Phase 2: label sync enabled -> backfill adds the missing keyword.
+	rec = newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.KeywordsUpdated != 1 {
+		t.Fatalf("keywords_updated = %d, want 1", sum.KeywordsUpdated)
+	}
+	flags := dst.inFolder(fakeDestFolder)[0].flags
+	if !slices.Contains(flags, imap.Flag("work")) {
+		t.Fatalf("missing keyword not backfilled: %v", flags)
+	}
+	if !slices.Contains(flags, imap.Flag("mytag")) {
+		t.Fatalf("user tag removed by backfill: %v", flags)
+	}
+}
+
+// Routing never creates a second copy even when the dest copy moved folders:
+// the guard checks both folders.
+func TestGuardChecksBothFoldersUnderRouting(t *testing.T) {
+	store, src, dst := routingSetup()
+	rec := newRec(store, src, dst, routingOpts())
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate state loss (keys wiped) but keep members knowledge minimal:
+	// m1 is in the inbox, its dest copy sits in the DEST folder; m2's copy
+	// sits in ARCHIVE. Wipe the copied set — the guard must find both.
+	store.keys = map[string]bool{}
+	store.meta = map[string]string{} // fingerprint too: backfill idempotent anyway
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 0 {
+		t.Fatalf("guard failed, copied %d duplicates", sum.Copied)
+	}
+	if dst.total() != 3 {
+		t.Fatalf("total = %d, want 3", dst.total())
+	}
+}
