@@ -26,6 +26,7 @@ type Endpoint struct {
 	User     string
 	Password string
 	Folder   string
+	TLS      bool // implicit TLS (IMAPS); disable only for local testing
 }
 
 // Addr returns host:port.
@@ -111,6 +112,7 @@ func Load() (*Config, error) {
 			User:     str("GMAIL_USER", ""),
 			Password: secret("GMAIL_APP_PASSWORD"),
 			Folder:   str("GMAIL_FOLDER", "[Gmail]/All Mail"),
+			TLS:      boolean("GMAIL_TLS", true),
 		},
 		Stalwart: Endpoint{
 			Host:     str("STALWART_HOST", "mail.lhns.de"),
@@ -118,6 +120,7 @@ func Load() (*Config, error) {
 			User:     str("STALWART_USER", ""),
 			Password: secret("STALWART_APP_PASSWORD"),
 			Folder:   str("STALWART_FOLDER", "Gmail"),
+			TLS:      boolean("STALWART_TLS", true),
 		},
 		PollInterval: time.Duration(num("POLL_INTERVAL", 900)) * time.Second,
 		IdleReset:    time.Duration(num("IDLE_RESET", 1500)) * time.Second,

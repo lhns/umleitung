@@ -57,7 +57,11 @@ func Dial(ep config.Endpoint) (*Client, error) {
 			},
 		},
 	}
-	c, err := imapclient.DialTLS(ep.Addr(), opts)
+	dial := imapclient.DialTLS
+	if !ep.TLS {
+		dial = imapclient.DialInsecure // local testing only
+	}
+	c, err := dial(ep.Addr(), opts)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", ep.Addr(), err)
 	}

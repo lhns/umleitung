@@ -39,11 +39,13 @@ variants pointing at a file (Docker/Swarm secrets).
 | `GMAIL_USER` | — (required) | Gmail address |
 | `GMAIL_APP_PASSWORD` / `_FILE` | — (required) | Gmail app password (account needs 2FA) |
 | `GMAIL_FOLDER` | `[Gmail]/All Mail` | Source folder |
+| `GMAIL_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
 | `STALWART_HOST` | `mail.lhns.de` | Destination IMAPS host |
 | `STALWART_PORT` | `993` | Destination port |
 | `STALWART_USER` | — (required) | Stalwart account |
 | `STALWART_APP_PASSWORD` / `_FILE` | — (required) | **Stalwart application password** (not the LDAP password, not OAuth) |
 | `STALWART_FOLDER` | `Gmail` | Destination folder; created if missing |
+| `STALWART_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
 | `POLL_INTERVAL` | `900` | Seconds between safety-net reconciles |
 | `IDLE_RESET` | `1500` | Max seconds for one IDLE session (Gmail force-logs-out idle connections after ~29 min; go-imap also auto-restarts IDLE every ~28 min) |
 | `STATE_PATH` | `/state/umleiter.db` | SQLite state database |
@@ -118,6 +120,15 @@ Layout: `internal/imapx` (IMAP wrapper) · `internal/state` (SQLite store) ·
 go test ./...
 docker build -t umleitung .
 ```
+
+Tests include a self-contained end-to-end suite (`internal/integration`) that
+spins up two in-memory IMAP servers (go-imap's `imapmemserver`) and runs the
+full mirror over real IMAP connections: first sync, duplicate Message-ID,
+missing Message-ID, state wipe + re-seed, incremental sync, the
+append-but-not-recorded crash window, UIDVALIDITY reset, and flag policy.
+No Docker or network required.
+
+Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/).
 
 ## Alternative: mbsync + goimapnotify (not used)
 
