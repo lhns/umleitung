@@ -106,6 +106,7 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind 
 		if err := r.store.SetFolderState(folder, uidValidity, stop); err != nil {
 			return err
 		}
+		r.opts.progress("membership", int(stop))
 	}
 	if uidNext <= 1 || lastUID >= uidNext-1 {
 		// Nothing scanned; still keep state current.
@@ -147,6 +148,7 @@ func (r *Reconciler) rebuildWatchedFolder(ctx context.Context, folder, pendingKi
 				return err
 			}
 		}
+		r.opts.progress("membership-rebuild", int(stop))
 	}
 	// Stored members no longer present anywhere in the folder -> removals.
 	for key := range storedKeys {
@@ -368,6 +370,7 @@ func (r *Reconciler) backfillDestFolder(ctx context.Context, folder string, sum 
 		if err != nil {
 			return fmt.Errorf("window %d:%d: %w", start, stop, err)
 		}
+		r.opts.progress("backfill", int(stop))
 		for i := range metas {
 			key := DedupKey(&metas[i])
 

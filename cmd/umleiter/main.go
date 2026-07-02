@@ -64,9 +64,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	var healthy atomic.Int64 // unix time of last successful reconcile
+	// Liveness heartbeat: bumped at boot and on every unit of progress
+	// (connect attempts, scan/mirror windows, IDLE wakes, backoff retries).
+	// /healthz turns unhealthy only when the heartbeat goes stale — a huge
+	// first run or a provider-throttled backoff is healthy; a wedged process
+	// is not.
+	var heartbeat atomic.Int64
+	heartbeat.Store(time.Now().Unix())
 	if cfg.HealthAddr != "" {
-		go serveHealth(cfg, log, &healthy)
+		go serveHealth(cfg, log, &heartbeat)
 	}
 
 	// Outer supervision loop: (re)connect both sides with exponential
@@ -81,11 +87,13 @@ func main() {
 			log.Info("shutting down")
 			return
 		}
-		err := runSession(ctx, cfg, store, log, &healthy)
+		heartbeat.Store(time.Now().Unix())
+		err := runSession(ctx, cfg, store, log, &heartbeat)
 		if err == nil || errors.Is(err, context.Canceled) {
 			log.Info("shutting down")
 			return
 		}
+		heartbeat.Store(time.Now().Unix())
 		log.Error("session ended, will reconnect", "err", err, "backoff", backoff)
 		select {
 		case <-time.After(backoff):
@@ -100,7 +108,7 @@ func main() {
 
 // runSession connects both endpoints and runs reconcile+IDLE until an error
 // or shutdown. Returning nil means clean shutdown.
-func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log *slog.Logger, healthy *atomic.Int64) error {
+func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log *slog.Logger, heartbeat *atomic.Int64) error {
 	src, err := imapx.Dial(cfg.Source)
 	if err != nil {
 		return err
@@ -137,6 +145,16 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 		return err
 	}
 
+	// Heartbeat + throttled progress logging for long-running phases.
+	var lastProgressLog atomic.Int64
+	onProgress := func(phase string, processed int) {
+		heartbeat.Store(time.Now().Unix())
+		now := time.Now().Unix()
+		if last := lastProgressLog.Load(); now-last >= 30 && lastProgressLog.CompareAndSwap(last, now) {
+			log.Info("progress", "phase", phase, "processed", processed)
+		}
+	}
+
 	rec := reconcile.New(store, src, dst, reconcile.Options{
 		UIDBatch:       cfg.UIDBatch,
 		DestGuard:      cfg.DestGuard,
@@ -149,6 +167,7 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 		SourceInbox:    cfg.SourceInbox,
 		ArchiveFolder:  cfg.ArchiveFolder,
 		LabelPropagate: cfg.LabelPropagate,
+		OnProgress:     onProgress,
 	}, log)
 
 	// Destination seeding: bootstrap the dedup set from what the destination
@@ -158,7 +177,7 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 	}
 
 	// Initial catch-up (may be large on first run; windowed + resumable).
-	if err := runReconcile(ctx, rec, log, healthy); err != nil {
+	if err := runReconcile(ctx, rec, log, heartbeat); err != nil {
 		return err
 	}
 
@@ -184,6 +203,7 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 			reason = "shutdown"
 		}
 		wake.Stop()
+		heartbeat.Store(time.Now().Unix())
 		if err := idle.Close(); err != nil {
 			return err
 		}
@@ -194,7 +214,7 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 			return nil
 		}
 		log.Debug("reconcile triggered", "reason", reason)
-		if err := runReconcile(ctx, rec, log, healthy); err != nil {
+		if err := runReconcile(ctx, rec, log, heartbeat); err != nil {
 			return err
 		}
 	}
@@ -225,13 +245,13 @@ func maybeSeed(ctx context.Context, cfg *config.Config, store *state.Store, rec 
 	return nil
 }
 
-func runReconcile(ctx context.Context, rec *reconcile.Reconciler, log *slog.Logger, healthy *atomic.Int64) error {
+func runReconcile(ctx context.Context, rec *reconcile.Reconciler, log *slog.Logger, heartbeat *atomic.Int64) error {
 	start := time.Now()
 	sum, err := rec.Run(ctx)
 	if err != nil {
 		return err
 	}
-	healthy.Store(time.Now().Unix())
+	heartbeat.Store(time.Now().Unix())
 	log.Info("reconcile done",
 		"candidates", sum.Candidates, "copied", sum.Copied, "skipped_dupes", sum.SkippedDup,
 		"moved_to_archive", sum.MovedToArchive, "moved_to_inbox", sum.MovedToInbox,
@@ -241,14 +261,16 @@ func runReconcile(ctx context.Context, rec *reconcile.Reconciler, log *slog.Logg
 	return nil
 }
 
-// serveHealth exposes /healthz: 200 while reconciles keep succeeding, 503 if
-// none succeeded within 3× POLL_INTERVAL (wedged container → Swarm restarts).
-func serveHealth(cfg *config.Config, log *slog.Logger, healthy *atomic.Int64) {
+// serveHealth exposes /healthz: 200 while the process shows signs of life
+// (progress windows, connect attempts, IDLE wakes), 503 when the heartbeat
+// goes stale for 3× POLL_INTERVAL (wedged container → Swarm restarts). Long
+// first runs and provider-throttle backoffs keep the heartbeat fresh.
+func serveHealth(cfg *config.Config, log *slog.Logger, heartbeat *atomic.Int64) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		last := healthy.Load()
+		last := heartbeat.Load()
 		if last == 0 || time.Since(time.Unix(last, 0)) > 3*cfg.PollInterval {
-			http.Error(w, "no successful reconcile recently", http.StatusServiceUnavailable)
+			http.Error(w, "no progress recently", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -292,7 +314,17 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: lvl,
+		// Render durations human-readable ("11ms", "15m0s") instead of raw
+		// nanosecond integers.
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Value.Kind() == slog.KindDuration {
+				a.Value = slog.StringValue(a.Value.Duration().String())
+			}
+			return a
+		},
+	}))
 	slog.SetDefault(log)
 	return log
 }

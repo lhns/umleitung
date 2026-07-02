@@ -86,6 +86,17 @@ type Options struct {
 	SourceInbox    string // source folder whose membership means "in inbox"
 	ArchiveFolder  string // destination folder for archived mail
 	LabelPropagate bool   // STORE keyword changes for post-copy label changes
+
+	// OnProgress, if set, is called after every committed work window in any
+	// long-running phase (seeding, membership scan, mirror, backfill). Used
+	// as a liveness heartbeat and for progress reporting during large runs.
+	OnProgress func(phase string, processed int)
+}
+
+func (o *Options) progress(phase string, processed int) {
+	if o.OnProgress != nil {
+		o.OnProgress(phase, processed)
+	}
 }
 
 func (o *Options) labelExcludeSet() map[string]bool {
@@ -200,6 +211,7 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 		if err := r.store.SetLastUID(stop); err != nil {
 			return sum, err
 		}
+		r.opts.progress("mirror", sum.Copied)
 	}
 
 	// Placement/keyword backfill: auto-corrects mail mirrored before the
@@ -355,6 +367,7 @@ func (r *Reconciler) seedFromDestFolder(ctx context.Context, folder string) (int
 			return seeded, err
 		}
 		seeded += int64(len(keys))
+		r.opts.progress("seed", int(seeded))
 	}
 	return seeded, nil
 }

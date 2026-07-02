@@ -626,6 +626,27 @@ func TestSeedFromDestPreventsRecopy(t *testing.T) {
 	}
 }
 
+func TestOnProgressCalledPerWindow(t *testing.T) {
+	store := newFakeStore()
+	var msgs []fakeMsg
+	for i := uint32(1); i <= 6; i++ {
+		msgs = append(msgs, msg(i, fmt.Sprintf("<p%d@x>", i), fmt.Sprintf("raw-p%d", i)))
+	}
+	src := &fakeSource{uidValidity: 7, msgs: msgs}
+	dst := newFakeDest()
+	var calls int
+	rec := newRec(store, src, dst, Options{
+		UIDBatch:   2, // 6 messages -> 3 mirror windows
+		OnProgress: func(phase string, processed int) { calls++ },
+	})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls < 3 {
+		t.Fatalf("OnProgress called %d times, want >= 3 (one per window)", calls)
+	}
+}
+
 func TestContextCancelStopsBetweenMessages(t *testing.T) {
 	store := newFakeStore()
 	src := &fakeSource{uidValidity: 7, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}}
