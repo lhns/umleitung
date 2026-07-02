@@ -12,6 +12,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 
 	"github.com/lhns/umleitung/internal/imapx"
+	"github.com/lhns/umleitung/internal/state"
 )
 
 // ---- fakes ----
@@ -54,6 +55,30 @@ func (s *fakeStore) CopiedCount() (int64, error) { return int64(len(s.keys)), ni
 func (s *fakeStore) SeedBatch(keys []string) error {
 	for _, k := range keys {
 		s.keys[k] = true
+	}
+	return nil
+}
+func (s *fakeStore) RecordKeys(records []state.KeyRecord) error {
+	for _, rec := range records {
+		if err := s.RecordKey(rec.Key, rec.UID, rec.CopiedAtUnix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *fakeStore) MemberChangeBatch(folder string, items []state.MemberChangeItem) error {
+	for _, it := range items {
+		if err := s.MemberChange(folder, it.Key, it.UID, it.Add, it.PendingKind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *fakeStore) DeletePendingBatch(ids []int64) error {
+	for _, id := range ids {
+		if err := s.DeletePending(id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -331,6 +356,17 @@ func (d *fakeDest) SearchMessageIDsIn(folder string, ids []string) (map[string]b
 	return found, nil
 }
 func (d *fakeDest) SupportsArbitraryKeywords() bool { return !d.noArbitraryKw }
+
+// fakePending defers the append outcome to Wait, exercising the pipelined
+// Wait-error paths in the consumer ring.
+type fakePending struct{ err error }
+
+func (p fakePending) Wait() error { return p.err }
+
+func (d *fakeDest) BeginAppend(folder string, msg *imapx.FullMessage, flags []imap.Flag) (imapx.PendingAppend, error) {
+	return fakePending{err: d.AppendTo(folder, msg, flags)}, nil
+}
+
 func (d *fakeDest) AppendTo(folder string, msg *imapx.FullMessage, flags []imap.Flag) error {
 	if d.appendErr != nil {
 		return d.appendErr
@@ -751,6 +787,38 @@ func TestPipelineOrderAndMidStreamFailure(t *testing.T) {
 	}
 	if sum.Copied != 3 || dst.total() != 6 {
 		t.Fatalf("resume: %+v total=%d, want 3 copied / 6 total", sum, dst.total())
+	}
+}
+
+// More copies than one record-flush batch: every key must still be recorded
+// (multiple flushes + final flush), order preserved through the append ring.
+func TestRecordBatchingAcrossFlushes(t *testing.T) {
+	store := newFakeStore()
+	var msgs []fakeMsg
+	for i := uint32(1); i <= 120; i++ { // > 2x recordFlushSize
+		msgs = append(msgs, msg(i, fmt.Sprintf("<b%d@x>", i), fmt.Sprintf("raw-b%d", i)))
+	}
+	src := &fakeSource{uidValidity: 7, msgs: msgs}
+	dst := newFakeDest()
+	rec := newRec(store, src, dst, Options{UIDBatch: 1000})
+
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 120 || dst.total() != 120 {
+		t.Fatalf("copied=%d total=%d, want 120/120", sum.Copied, dst.total())
+	}
+	for i := 1; i <= 120; i++ {
+		if !store.keys[fmt.Sprintf("<b%d@x>", i)] {
+			t.Fatalf("key b%d not recorded", i)
+		}
+	}
+	// FIFO order through the ring.
+	for i, raw := range dst.appended {
+		if raw != fmt.Sprintf("raw-b%d", i+1) {
+			t.Fatalf("append order broken at %d: %s", i, raw)
+		}
 	}
 }
 

@@ -148,6 +148,55 @@ func TestMemberChangeWithPendingIsAtomic(t *testing.T) {
 	}
 }
 
+func TestMemberChangeBatchAtomic(t *testing.T) {
+	s := openTemp(t)
+	items := []MemberChangeItem{
+		{Key: "<a@x>", UID: 1, Add: true, PendingKind: "keyword"},
+		{Key: "<b@x>", UID: 2, Add: true},
+		{Key: "<a@x>", Add: false, PendingKind: "move"},
+	}
+	if err := s.MemberChangeBatch("Work", items); err != nil {
+		t.Fatal(err)
+	}
+	if has, _ := s.MemberHas("Work", "<a@x>"); has {
+		t.Fatal("removal in same batch not applied")
+	}
+	if has, _ := s.MemberHas("Work", "<b@x>"); !has {
+		t.Fatal("addition not applied")
+	}
+	ops, _ := s.PendingOps(10)
+	if len(ops) != 2 || ops[0].Kind != "keyword" || ops[1].Kind != "move" {
+		t.Fatalf("pending = %+v, want keyword-add then move-remove", ops)
+	}
+	// Batch delete drains both in one call.
+	if err := s.DeletePendingBatch([]int64{ops[0].ID, ops[1].ID}); err != nil {
+		t.Fatal(err)
+	}
+	if ops, _ := s.PendingOps(10); len(ops) != 0 {
+		t.Fatalf("pending not drained: %+v", ops)
+	}
+	if err := s.MemberChangeBatch("Work", nil); err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+}
+
+func TestRecordKeysBatch(t *testing.T) {
+	s := openTemp(t)
+	if err := s.RecordKeys([]KeyRecord{
+		{Key: "<a@x>", UID: 1, CopiedAtUnix: 1},
+		{Key: "<b@x>", UID: 2, CopiedAtUnix: 2},
+		{Key: "<a@x>", UID: 3, CopiedAtUnix: 3}, // idempotent within batch
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CopiedCount(); n != 2 {
+		t.Fatalf("count = %d, want 2", n)
+	}
+	if err := s.RecordKeys(nil); err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+}
+
 func TestFolderStateRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.db")

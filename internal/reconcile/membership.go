@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
+
+	"github.com/lhns/umleitung/internal/state"
 )
 
 // pendingMove/pendingKeyword are the pending-op kinds (state.pending.kind).
@@ -70,7 +72,8 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind,
 		return r.rebuildWatchedFolder(ctx, folder, pendingKind, item, uidValidity, uidNext)
 	}
 
-	// Removal detection: uid-set diff against the full current snapshot.
+	// Removal detection: uid-set diff against the full current snapshot,
+	// applied as one batched transaction.
 	currentUIDs, err := r.src.SearchAllUIDs()
 	if err != nil {
 		return err
@@ -83,18 +86,25 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind,
 	if err != nil {
 		return err
 	}
+	var removals []state.MemberChangeItem
 	for uid, key := range stored {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if !current[uid] {
-			if err := r.memberChange(folder, key, 0, false, pendingKind); err != nil {
+			kind, err := r.gatePending(key, pendingKind)
+			if err != nil {
 				return err
 			}
+			removals = append(removals, state.MemberChangeItem{Key: key, PendingKind: kind})
 		}
 	}
+	if err := r.store.MemberChangeBatch(folder, removals); err != nil {
+		return err
+	}
 
-	// Addition detection: windowed scan above the high-water mark.
+	// Addition detection: windowed scan above the high-water mark; one
+	// transaction per window.
 	for start := lastUID + 1; start < uidNext; start += uint32(r.opts.UIDBatch) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -104,11 +114,17 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind,
 		if err != nil {
 			return fmt.Errorf("window %d:%d: %w", start, stop, err)
 		}
+		items := make([]state.MemberChangeItem, 0, len(metas))
 		for i := range metas {
 			key := DedupKey(&metas[i])
-			if err := r.memberChange(folder, key, uint32(metas[i].UID), true, pendingKind); err != nil {
+			kind, err := r.gatePending(key, pendingKind)
+			if err != nil {
 				return err
 			}
+			items = append(items, state.MemberChangeItem{Key: key, UID: uint32(metas[i].UID), Add: true, PendingKind: kind})
+		}
+		if err := r.store.MemberChangeBatch(folder, items); err != nil {
+			return err
 		}
 		if err := r.store.SetFolderState(folder, uidValidity, stop); err != nil {
 			return err
@@ -142,49 +158,60 @@ func (r *Reconciler) rebuildWatchedFolder(ctx context.Context, folder, pendingKi
 		if err != nil {
 			return fmt.Errorf("rebuild window %d:%d: %w", start, stop, err)
 		}
+		items := make([]state.MemberChangeItem, 0, len(metas))
 		for i := range metas {
 			key := DedupKey(&metas[i])
 			seen[key] = true
-			kind := pendingKind
-			if firstScan || storedKeys[key] {
-				// Already a member (uid refresh) or first activation
-				// (backfill handles placement/keywords for existing mail).
-				kind = ""
+			kind := ""
+			if !firstScan && !storedKeys[key] {
+				// New member; first activation and uid refreshes need no
+				// pending op (backfill handles existing mail's placement).
+				if kind, err = r.gatePending(key, pendingKind); err != nil {
+					return err
+				}
 			}
-			if err := r.memberChange(folder, key, uint32(metas[i].UID), true, kind); err != nil {
-				return err
-			}
+			items = append(items, state.MemberChangeItem{Key: key, UID: uint32(metas[i].UID), Add: true, PendingKind: kind})
+		}
+		if err := r.store.MemberChangeBatch(folder, items); err != nil {
+			return err
 		}
 		r.opts.progress("membership-rebuild", item, int(stop))
 	}
 	// Stored members no longer present anywhere in the folder -> removals.
+	var removals []state.MemberChangeItem
 	for key := range storedKeys {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if !seen[key] {
-			if err := r.memberChange(folder, key, 0, false, pendingKind); err != nil {
+			kind, err := r.gatePending(key, pendingKind)
+			if err != nil {
 				return err
 			}
+			removals = append(removals, state.MemberChangeItem{Key: key, PendingKind: kind})
 		}
+	}
+	if err := r.store.MemberChangeBatch(folder, removals); err != nil {
+		return err
 	}
 	return r.store.SetFolderState(folder, uidValidity, uidNext-1)
 }
 
-// memberChange records a membership change, enqueueing the pending
-// destination op only when it is actually applicable: the message must
-// already be mirrored and locatable by a real Message-ID.
-func (r *Reconciler) memberChange(folder, key string, uid uint32, add bool, pendingKind string) error {
-	if pendingKind != "" {
-		copied, err := r.store.HasKey(key)
-		if err != nil {
-			return err
-		}
-		if !copied || !IsRealMessageID(key) {
-			pendingKind = ""
-		}
+// gatePending returns the pending-op kind for a membership change, or "" when
+// no destination op is applicable: the message must already be mirrored and
+// locatable by a real Message-ID.
+func (r *Reconciler) gatePending(key, pendingKind string) (string, error) {
+	if pendingKind == "" || !IsRealMessageID(key) {
+		return "", nil
 	}
-	return r.store.MemberChange(folder, key, uid, add, pendingKind)
+	copied, err := r.store.HasKey(key)
+	if err != nil {
+		return "", err
+	}
+	if !copied {
+		return "", nil
+	}
+	return pendingKind, nil
 }
 
 // labelsFor returns the labels of a message: its watched-folder memberships
@@ -270,16 +297,23 @@ func (r *Reconciler) propagate(ctx context.Context, sum *Summary) error {
 		if len(ops) == 0 {
 			return nil
 		}
+		// Delete applied ops in one transaction per drained page; on a
+		// mid-page failure only the completed prefix is deleted (the failed
+		// op survives and retries next pass).
+		var done []int64
 		for _, op := range ops {
 			if err := ctx.Err(); err != nil {
+				_ = r.store.DeletePendingBatch(done)
 				return err
 			}
 			if err := r.applyPending(op, sum); err != nil {
+				_ = r.store.DeletePendingBatch(done)
 				return fmt.Errorf("pending op %d (%s %s %q): %w", op.ID, op.Kind, op.Op, op.Folder, err)
 			}
-			if err := r.store.DeletePending(op.ID); err != nil {
-				return err
-			}
+			done = append(done, op.ID)
+		}
+		if err := r.store.DeletePendingBatch(done); err != nil {
+			return err
 		}
 	}
 }

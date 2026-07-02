@@ -34,15 +34,18 @@ type Store interface {
 	RecordKey(key string, uid uint32, copiedAtUnix int64) error
 	CopiedCount() (int64, error)
 	SeedBatch(keys []string) error
+	RecordKeys(records []state.KeyRecord) error
 	FolderState(name string) (uidValidity, lastUID uint32, err error)
 	SetFolderState(name string, uidValidity, lastUID uint32) error
 	MemberChange(folder, key string, uid uint32, add bool, pendingKind string) error
+	MemberChangeBatch(folder string, items []state.MemberChangeItem) error
 	MemberHas(folder, key string) (bool, error)
 	MemberFolders(key string) ([]string, error)
 	MemberUIDKeys(folder string) (map[uint32]string, error)
 	MemberKeys(folder string) (map[string]bool, error)
 	PendingOps(limit int) ([]PendingOp, error)
 	DeletePending(id int64) error
+	DeletePendingBatch(ids []int64) error
 	MetaGet(key string) (string, error)
 	MetaSet(key, value string) error
 }
@@ -64,6 +67,7 @@ type Dest interface {
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
 	SearchMessageIDsIn(folder string, ids []string) (map[string]bool, error)
 	AppendTo(folder string, msg *imapx.FullMessage, flags []imap.Flag) error
+	BeginAppend(folder string, msg *imapx.FullMessage, flags []imap.Flag) (imapx.PendingAppend, error)
 	MoveMessageID(fromFolder, toFolder, messageID string) (bool, error)
 	MoveUIDs(fromFolder string, uids []imap.UID, toFolder string) error
 	StoreKeywordByMessageID(folder, messageID string, add bool, kw imap.Flag) (bool, error)
@@ -322,9 +326,29 @@ type copyItem struct {
 	pc   pendingCopy
 }
 
-// copyPipeline overlaps the Gmail body stream (producer) with Stalwart
+// inflightAppend is an APPEND awaiting server confirmation in the ring.
+type inflightAppend struct {
+	pa          imapx.PendingAppend
+	pc          pendingCopy
+	full        *imapx.FullMessage
+	baseFlags   []imap.Flag
+	hadKeywords bool
+}
+
+// appendRing bounds pipelined (issued-but-unconfirmed) APPENDs; together
+// with recordFlushSize this is the crash window the batched destination
+// guard covers (appended-but-unrecorded messages are re-detected next run).
+const (
+	appendRing      = 4
+	recordFlushSize = 50
+)
+
+// copyPipeline overlaps the source body stream (producer) with destination
 // appends (consumer). Single producer + single consumer = FIFO order; the
-// consumer alone touches the store (append-then-record per message).
+// consumer alone touches the store. Appends are pipelined (ring of
+// appendRing in flight — no per-message dest round trip) and dedup records
+// are flushed in batched transactions (recordFlushSize, at stream end, and
+// on any error — state stays behind reality, never ahead).
 func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *Summary) error {
 	byUID := make(map[imap.UID]pendingCopy, len(pend))
 	uids := make([]imap.UID, 0, len(pend))
@@ -340,21 +364,89 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 
 	go func() {
 		defer close(done)
+		var ring []inflightAppend
+		var records []state.KeyRecord
+
+		fail := func(err error) {
+			if consErr == nil {
+				consErr = err
+				close(failed)
+			}
+		}
+		flushRecords := func() {
+			if len(records) == 0 {
+				return
+			}
+			if err := r.store.RecordKeys(records); err != nil {
+				fail(err)
+				return
+			}
+			records = records[:0]
+		}
+		// settleOldest confirms the oldest in-flight append and buffers its
+		// record — APPEND confirmed first, record after, never the reverse.
+		settleOldest := func() {
+			it := ring[0]
+			ring = ring[1:]
+			if err := it.pa.Wait(); err != nil {
+				if !it.hadKeywords {
+					fail(fmt.Errorf("uid %d: %w", it.pc.uid, err))
+					return
+				}
+				// The mirror always wins over label decoration: retry once
+				// without keywords before treating this as an error.
+				r.log.Warn("append with label keywords failed; retrying without keywords",
+					"uid", it.pc.uid, "err", err)
+				if err := r.dst.AppendTo(it.pc.destFolder, it.full, it.baseFlags); err != nil {
+					fail(fmt.Errorf("uid %d: %w", it.pc.uid, err))
+					return
+				}
+			}
+			records = append(records, state.KeyRecord{
+				Key: it.pc.key, UID: uint32(it.pc.uid), CopiedAtUnix: r.now().Unix(),
+			})
+			sum.Copied++
+			// Every copy: keeps the heartbeat fresh and progress lines
+			// flowing even when the provider bandwidth-shapes the stream.
+			r.opts.progress("mirror", "", sum.Copied)
+			if len(records) >= recordFlushSize {
+				flushRecords()
+			}
+		}
+
 		for it := range ch {
 			if consErr != nil {
 				continue // drain so the producer never blocks
 			}
-			if err := r.appendOne(it.pc, it.full); err != nil {
-				consErr = fmt.Errorf("uid %d: %w", it.pc.uid, err)
-				close(failed)
+			baseFlags := safeFlags(it.full.Flags, r.opts.CarrySeen)
+			flags := baseFlags
+			var keywords []imap.Flag
+			if r.opts.SyncLabels {
+				labels, err := r.labelsFor(it.pc.key)
+				if err != nil {
+					fail(err)
+					continue
+				}
+				keywords = keywordFlags(labels)
+				flags = append(append([]imap.Flag{}, baseFlags...), keywords...)
+			}
+			pa, err := r.dst.BeginAppend(it.pc.destFolder, it.full, flags)
+			if err != nil {
+				fail(fmt.Errorf("uid %d: %w", it.pc.uid, err))
 				continue
 			}
-			sum.Copied++
-			// Every copy: keeps the heartbeat fresh and progress lines
-			// flowing even when the provider bandwidth-shapes the stream
-			// (the caller throttles actual log output).
-			r.opts.progress("mirror", "", sum.Copied)
+			ring = append(ring, inflightAppend{
+				pa: pa, pc: it.pc, full: it.full,
+				baseFlags: baseFlags, hadKeywords: len(keywords) > 0,
+			})
+			if len(ring) >= appendRing {
+				settleOldest()
+			}
 		}
+		for consErr == nil && len(ring) > 0 {
+			settleOldest()
+		}
+		flushRecords()
 	}()
 
 	prodErr := r.src.FetchFullStream(uids, func(full *imapx.FullMessage) error {
@@ -381,36 +473,6 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 		return prodErr
 	}
 	return ctx.Err()
-}
-
-// appendOne appends a fetched message to its routed folder and records the
-// dedup key — APPEND first, record after, never the other way around.
-func (r *Reconciler) appendOne(pc pendingCopy, full *imapx.FullMessage) error {
-	baseFlags := safeFlags(full.Flags, r.opts.CarrySeen)
-	flags := baseFlags
-	var keywords []imap.Flag
-	if r.opts.SyncLabels {
-		labels, err := r.labelsFor(pc.key)
-		if err != nil {
-			return err
-		}
-		keywords = keywordFlags(labels)
-		flags = append(append([]imap.Flag{}, baseFlags...), keywords...)
-	}
-
-	if err := r.dst.AppendTo(pc.destFolder, full, flags); err != nil {
-		if len(keywords) == 0 {
-			return err
-		}
-		// The mirror always wins over label decoration: retry once without
-		// keywords before treating this as an error.
-		r.log.Warn("append with label keywords failed; retrying without keywords",
-			"uid", pc.uid, "keywords", len(keywords), "err", err)
-		if err := r.dst.AppendTo(pc.destFolder, full, baseFlags); err != nil {
-			return err
-		}
-	}
-	return r.store.RecordKey(pc.key, uint32(pc.uid), r.now().Unix())
 }
 
 // safeFlags builds the flag set for the destination APPEND: optionally carry

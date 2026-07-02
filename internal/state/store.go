@@ -152,6 +152,121 @@ func (s *Store) MemberChange(folder, key string, uid uint32, add bool, pendingKi
 	return tx.Commit()
 }
 
+// MemberChangeItem is one membership change for MemberChangeBatch.
+type MemberChangeItem struct {
+	Key         string
+	UID         uint32
+	Add         bool
+	PendingKind string // "" = no pending op
+}
+
+// MemberChangeBatch applies a window's worth of membership changes and their
+// pending ops in ONE transaction — same atomicity guarantee as per-item
+// MemberChange, coarser grain (thousands of fsync round trips fewer on slow
+// state volumes).
+func (s *Store) MemberChangeBatch(folder string, items []MemberChangeItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	add, err := tx.Prepare(`INSERT INTO members (folder, message_id, uid) VALUES (?, ?, ?)
+		ON CONFLICT(folder, message_id) DO UPDATE SET uid = excluded.uid`)
+	if err != nil {
+		return err
+	}
+	defer add.Close()
+	del, err := tx.Prepare(`DELETE FROM members WHERE folder = ? AND message_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer del.Close()
+	pend, err := tx.Prepare(`INSERT INTO pending (kind, message_id, folder, op) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer pend.Close()
+	for _, it := range items {
+		if it.Add {
+			_, err = add.Exec(folder, it.Key, it.UID)
+		} else {
+			_, err = del.Exec(folder, it.Key)
+		}
+		if err != nil {
+			return err
+		}
+		if it.PendingKind != "" {
+			op := "remove"
+			if it.Add {
+				op = "add"
+			}
+			if _, err := pend.Exec(it.PendingKind, it.Key, folder, op); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+// KeyRecord is one copied-message record for RecordKeys.
+type KeyRecord struct {
+	Key          string
+	UID          uint32
+	CopiedAtUnix int64
+}
+
+// RecordKeys records a batch of dedup keys in one transaction. Idempotent
+// per key, like RecordKey.
+func (s *Store) RecordKeys(records []KeyRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO copied (message_id, uid, copied_at) VALUES (?, ?, ?)
+		ON CONFLICT(message_id) DO NOTHING`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, r := range records {
+		if _, err := stmt.Exec(r.Key, r.UID, r.CopiedAtUnix); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// DeletePendingBatch removes a batch of confirmed-applied pending operations
+// in one transaction.
+func (s *Store) DeletePendingBatch(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`DELETE FROM pending WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, id := range ids {
+		if _, err := stmt.Exec(id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // MemberHas reports whether the message is a member of the folder.
 func (s *Store) MemberHas(folder, key string) (bool, error) {
 	var one int

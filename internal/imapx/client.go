@@ -441,9 +441,29 @@ func (cl *Client) Append(msg *FullMessage, flags []imap.Flag) error {
 	return cl.AppendTo(cl.ep.Folder, msg, flags)
 }
 
-// AppendTo appends a raw message to the named folder, preserving
-// INTERNALDATE and the given flags. Returns only after the server confirms.
-func (cl *Client) AppendTo(folder string, msg *FullMessage, flags []imap.Flag) error {
+// PendingAppend is an issued-but-unconfirmed APPEND (see BeginAppend).
+type PendingAppend interface {
+	// Wait blocks until the server confirms (or rejects) the append.
+	Wait() error
+}
+
+type pendingAppend struct {
+	cmd    *imapclient.AppendCommand
+	folder string
+	addr   string
+}
+
+func (p *pendingAppend) Wait() error {
+	if _, err := p.cmd.Wait(); err != nil {
+		return fmt.Errorf("append to %q on %s: %w", p.folder, p.addr, err)
+	}
+	return nil
+}
+
+// BeginAppend issues an APPEND (command + literal fully written) and returns
+// without waiting for the tagged response, enabling pipelined appends —
+// go-imap's client is async, so several appends can be in flight at once.
+func (cl *Client) BeginAppend(folder string, msg *FullMessage, flags []imap.Flag) (PendingAppend, error) {
 	opts := &imap.AppendOptions{Flags: flags}
 	if !msg.InternalDate.IsZero() {
 		opts.Time = msg.InternalDate
@@ -451,15 +471,22 @@ func (cl *Client) AppendTo(folder string, msg *FullMessage, flags []imap.Flag) e
 	cmd := cl.c.Append(folder, int64(len(msg.Raw)), opts)
 	if _, err := cmd.Write(msg.Raw); err != nil {
 		cmd.Close()
-		return fmt.Errorf("append write to %s: %w", cl.ep.Addr(), err)
+		return nil, fmt.Errorf("append write to %s: %w", cl.ep.Addr(), err)
 	}
 	if err := cmd.Close(); err != nil {
-		return fmt.Errorf("append close to %s: %w", cl.ep.Addr(), err)
+		return nil, fmt.Errorf("append close to %s: %w", cl.ep.Addr(), err)
 	}
-	if _, err := cmd.Wait(); err != nil {
-		return fmt.Errorf("append to %q on %s: %w", folder, cl.ep.Addr(), err)
+	return &pendingAppend{cmd: cmd, folder: folder, addr: cl.ep.Addr()}, nil
+}
+
+// AppendTo appends a raw message to the named folder, preserving
+// INTERNALDATE and the given flags. Returns only after the server confirms.
+func (cl *Client) AppendTo(folder string, msg *FullMessage, flags []imap.Flag) error {
+	p, err := cl.BeginAppend(folder, msg, flags)
+	if err != nil {
+		return err
 	}
-	return nil
+	return p.Wait()
 }
 
 // searchMessageIDUIDs returns the UIDs matching a Message-ID header in the
