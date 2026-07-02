@@ -66,15 +66,42 @@ mail and folder semantics stay clean.
 
 ## Deployment
 
-Single container. Compose:
+Single container. Example `docker-compose.yml` (mirroring a Gmail account
+into a self-hosted server):
 
-```sh
-mkdir -p state && chown -R 65532 state   # distroless runs as nonroot (uid 65532)
-SOURCE_USER=... SOURCE_PASSWORD=... DEST_HOST=... DEST_USER=... DEST_PASSWORD=... \
-  docker compose up -d
+```yaml
+services:
+  umleiter:
+    image: ghcr.io/lhns/umleitung:latest
+    restart: unless-stopped
+    environment:
+      SOURCE_HOST: "imap.gmail.com"
+      SOURCE_USER: "user@gmail.com"
+      SOURCE_PASSWORD: "the-gmail-app-password"
+      SOURCE_FOLDER: "[Gmail]/All Mail"
+      DEST_HOST: "mail.example.org"
+      DEST_USER: "user@example.org"
+      DEST_PASSWORD: "the-dest-app-password"
+      DEST_FOLDER: "Mirror"
+    volumes:
+      # Persistent state (dedup fast path). Owner must be uid 65532
+      # (distroless nonroot): chown -R 65532 ./state
+      - ./state:/state
+    healthcheck:
+      test: ["CMD", "/umleiter", "-healthcheck"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
 ```
 
-Docker Swarm (secrets, bind mount, `replicas: 1`): see [`stack.yml`](stack.yml).
+```sh
+mkdir -p state && chown -R 65532 state
+docker compose up -d
+```
+
+Prefer `SOURCE_PASSWORD_FILE`/`DEST_PASSWORD_FILE` over inline passwords where
+possible. A ready-to-edit copy lives at [`docker-compose.yml`](docker-compose.yml);
+for Docker Swarm (secrets, bind mount, `replicas: 1`) see [`stack.yml`](stack.yml).
 
 **Never run more than one instance.** Two syncers would race to append. The
 file lock refuses a second instance on the same state volume, and the Swarm
