@@ -5,6 +5,7 @@ package imapx
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -53,6 +54,9 @@ type Client struct {
 	// selected is the currently selected folder ("" = none yet); used to
 	// skip redundant SELECT round trips.
 	selected string
+	// guardChunk is the adaptive Message-ID batch size for guard searches
+	// (halved on server BAD responses; 0 = start at the default).
+	guardChunk int
 	// arbitraryKeywords records whether the last SELECTed mailbox advertised
 	// PERMANENTFLAGS \* (arbitrary keywords storable).
 	arbitraryKeywords bool
@@ -259,13 +263,17 @@ func (cl *Client) fetchMetas(uidSet imap.UIDSet) ([]MsgMeta, error) {
 	return metas, nil
 }
 
-// guardChunk bounds Message-IDs per SEARCH command (command-length limits).
+// guardChunk is the initial Message-ID count per SEARCH command; servers
+// with stricter filter limits shrink it adaptively (see SearchMessageIDsIn).
 const guardChunk = 100
 
 // SearchMessageIDsIn reports which of the given Message-IDs exist in the
-// named folder. Batched: one `UID SEARCH` per chunk of ~100 ids (an OR-tree
-// of HEADER criteria); only chunks with hits cost an extra header fetch to
-// identify which ids matched. Used by the mirror's destination guard.
+// named folder. Batched: one `UID SEARCH` per chunk (an OR-tree of HEADER
+// criteria); only chunks with hits cost an extra header fetch to identify
+// which ids matched. If the server rejects a chunk with BAD (filter-depth /
+// complexity limits vary per implementation), the chunk size is halved and
+// remembered for the rest of the session — self-tuning down to single-id
+// searches in the worst case.
 func (cl *Client) SearchMessageIDsIn(folder string, ids []string) (map[string]bool, error) {
 	found := map[string]bool{}
 	if len(ids) == 0 {
@@ -274,11 +282,20 @@ func (cl *Client) SearchMessageIDsIn(folder string, ids []string) (map[string]bo
 	if err := cl.ensureSelected(folder); err != nil {
 		return nil, err
 	}
-	for chunk := range slices.Chunk(ids, guardChunk) {
-		data, err := cl.c.UIDSearch(orMessageIDCriteria(chunk), nil).Wait()
+	if cl.guardChunk == 0 {
+		cl.guardChunk = guardChunk
+	}
+	for i := 0; i < len(ids); {
+		end := min(i+cl.guardChunk, len(ids))
+		data, err := cl.c.UIDSearch(orMessageIDCriteria(ids[i:end]), nil).Wait()
 		if err != nil {
+			if cl.guardChunk > 1 && isBadResponse(err) {
+				cl.guardChunk /= 2
+				continue // retry the same span with a smaller chunk
+			}
 			return nil, fmt.Errorf("batch Message-ID search on %s: %w", cl.ep.Addr(), err)
 		}
+		i = end
 		uids := data.AllUIDs()
 		if len(uids) == 0 {
 			continue
@@ -287,13 +304,20 @@ func (cl *Client) SearchMessageIDsIn(folder string, ids []string) (map[string]bo
 		if err != nil {
 			return nil, err
 		}
-		for i := range metas {
-			if metas[i].MessageID != "" {
-				found[metas[i].MessageID] = true
+		for j := range metas {
+			if metas[j].MessageID != "" {
+				found[metas[j].MessageID] = true
 			}
 		}
 	}
 	return found, nil
+}
+
+// isBadResponse reports whether err is a tagged BAD from the server (the
+// server understood the command but rejected its complexity/arguments).
+func isBadResponse(err error) bool {
+	var imapErr *imap.Error
+	return errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeBad
 }
 
 // orMessageIDCriteria builds `OR ... OR HEADER Message-Id x ...` as a

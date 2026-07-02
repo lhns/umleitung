@@ -22,6 +22,9 @@ import (
 	"github.com/lhns/umleitung/internal/mirror"
 )
 
+// version is stamped by the build (-ldflags -X main.version=<git sha>).
+var version = "dev"
+
 func main() {
 	// `umleiter -healthcheck` probes the running instance's /healthz and
 	// exits 0/1 — used as the container HEALTHCHECK (distroless has no curl).
@@ -36,7 +39,7 @@ func main() {
 	}
 
 	log := newLogger(cfg.LogLevel)
-	log.Info("umleiter starting", "config", config.Path(), "mirrors", len(cfg.Mirrors))
+	log.Info("umleiter starting", "version", version, "config", config.Path(), "mirrors", len(cfg.Mirrors))
 
 	// Cross-process guard: refuse to start if another instance holds the
 	// state volume. Two instances would double-append.

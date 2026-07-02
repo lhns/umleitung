@@ -6,7 +6,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /umleiter ./cmd/umleiter
+ARG GIT_SHA=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${GIT_SHA}" -o /umleiter ./cmd/umleiter
 
 # ---- final stage ----
 # distroless/static ships CA certs and a nonroot user; the binary is static.
