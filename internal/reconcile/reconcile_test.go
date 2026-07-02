@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"testing"
 	"time"
 
@@ -19,9 +20,18 @@ type fakeStore struct {
 	lastUID     uint32
 	keys        map[string]bool
 	failRecord  bool
+
+	labels       map[string]map[string]bool // dedup key -> label set
+	folderStates map[string][2]uint32       // folder -> {uidvalidity, last_uid}
 }
 
-func newFakeStore() *fakeStore { return &fakeStore{keys: map[string]bool{}} }
+func newFakeStore() *fakeStore {
+	return &fakeStore{
+		keys:         map[string]bool{},
+		labels:       map[string]map[string]bool{},
+		folderStates: map[string][2]uint32{},
+	}
+}
 
 func (s *fakeStore) UIDValidity() (uint32, error)  { return s.uidValidity, nil }
 func (s *fakeStore) SetUIDValidity(v uint32) error { s.uidValidity = v; return nil }
@@ -42,29 +52,97 @@ func (s *fakeStore) SeedBatch(keys []string) error {
 	}
 	return nil
 }
+func (s *fakeStore) AddLabel(key, label string) error {
+	if s.labels[key] == nil {
+		s.labels[key] = map[string]bool{}
+	}
+	s.labels[key][label] = true
+	return nil
+}
+func (s *fakeStore) LabelsFor(key string) ([]string, error) {
+	var out []string
+	for l := range s.labels[key] {
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+func (s *fakeStore) FolderState(name string) (uint32, uint32, error) {
+	st := s.folderStates[name]
+	return st[0], st[1], nil
+}
+func (s *fakeStore) SetFolderState(name string, uidValidity, lastUID uint32) error {
+	s.folderStates[name] = [2]uint32{uidValidity, lastUID}
+	return nil
+}
 
 type fakeMsg struct {
 	meta imapx.MsgMeta
 	raw  string
 }
 
-type fakeSource struct {
+const fakeMainFolder = "AllMail"
+
+type fakeLabelFolder struct {
 	uidValidity uint32
-	msgs        []fakeMsg // ascending UIDs
-	metaCalls   int
-	failAfter   int // fail FetchMetaRange after N calls (0 = never)
+	msgs        []fakeMsg
+	attrs       []imap.MailboxAttr
 }
 
-func (f *fakeSource) uidNext() uint32 {
+type fakeSource struct {
+	uidValidity  uint32
+	msgs         []fakeMsg // ascending UIDs (main folder)
+	metaCalls    int
+	failAfter    int                         // fail FetchMetaRange after N calls (0 = never)
+	labelFolders map[string]*fakeLabelFolder // extra folders returned by LIST
+	selected     string                      // currently selected folder ("" = main)
+}
+
+func uidNextOf(msgs []fakeMsg) uint32 {
 	var maxUID imap.UID
-	for _, m := range f.msgs {
+	for _, m := range msgs {
 		maxUID = max(maxUID, m.meta.UID)
 	}
 	return uint32(maxUID) + 1
 }
 
+func (f *fakeSource) uidNext() uint32 { return uidNextOf(f.msgs) }
+
 func (f *fakeSource) SelectFolder() (uint32, uint32, uint32, error) {
-	return f.uidValidity, f.uidNext(), uint32(len(f.msgs)), nil
+	return f.SelectNamedFolder(fakeMainFolder)
+}
+
+func (f *fakeSource) SelectNamedFolder(name string) (uint32, uint32, uint32, error) {
+	if name == fakeMainFolder {
+		f.selected = ""
+		return f.uidValidity, f.uidNext(), uint32(len(f.msgs)), nil
+	}
+	lf, ok := f.labelFolders[name]
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("no such folder %q", name)
+	}
+	f.selected = name
+	return lf.uidValidity, uidNextOf(lf.msgs), uint32(len(lf.msgs)), nil
+}
+
+func (f *fakeSource) ListFolders() ([]imapx.FolderInfo, error) {
+	out := []imapx.FolderInfo{{Name: fakeMainFolder}}
+	var names []string
+	for name := range f.labelFolders {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		out = append(out, imapx.FolderInfo{Name: name, Attrs: f.labelFolders[name].attrs})
+	}
+	return out, nil
+}
+
+func (f *fakeSource) selectedMsgs() []fakeMsg {
+	if f.selected == "" {
+		return f.msgs
+	}
+	return f.labelFolders[f.selected].msgs
 }
 
 func (f *fakeSource) FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error) {
@@ -73,7 +151,7 @@ func (f *fakeSource) FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, erro
 		return nil, fmt.Errorf("connection dropped (injected)")
 	}
 	var out []imapx.MsgMeta
-	for _, m := range f.msgs {
+	for _, m := range f.selectedMsgs() {
 		if m.meta.UID >= start && m.meta.UID <= stop {
 			out = append(out, m.meta)
 		}
@@ -82,7 +160,7 @@ func (f *fakeSource) FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, erro
 }
 
 func (f *fakeSource) FetchFull(uid imap.UID) (*imapx.FullMessage, error) {
-	for _, m := range f.msgs {
+	for _, m := range f.selectedMsgs() {
 		if m.meta.UID == uid {
 			return &imapx.FullMessage{Raw: []byte(m.raw), InternalDate: m.meta.InternalDate}, nil
 		}
@@ -91,9 +169,12 @@ func (f *fakeSource) FetchFull(uid imap.UID) (*imapx.FullMessage, error) {
 }
 
 type fakeDest struct {
-	appended   []string // raw bodies, in append order
-	messageIDs map[string]bool
-	appendErr  error
+	appended       []string     // raw bodies, in append order
+	appendedFlags  [][]imap.Flag // flags per append, parallel to appended
+	messageIDs     map[string]bool
+	appendErr      error
+	rejectKeywords bool // reject any APPEND carrying non-\Seen flags
+	noArbitraryKw  bool
 }
 
 func newFakeDest() *fakeDest { return &fakeDest{messageIDs: map[string]bool{}} }
@@ -112,11 +193,20 @@ func (d *fakeDest) FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
 	return out, nil
 }
 func (d *fakeDest) HasMessageID(mid string) (bool, error) { return d.messageIDs[mid], nil }
-func (d *fakeDest) Append(msg *imapx.FullMessage, _ []imap.Flag) error {
+func (d *fakeDest) SupportsArbitraryKeywords() bool       { return !d.noArbitraryKw }
+func (d *fakeDest) Append(msg *imapx.FullMessage, flags []imap.Flag) error {
 	if d.appendErr != nil {
 		return d.appendErr
 	}
+	if d.rejectKeywords {
+		for _, f := range flags {
+			if f != imap.FlagSeen {
+				return fmt.Errorf("keyword %q not permitted (injected)", f)
+			}
+		}
+	}
 	d.appended = append(d.appended, string(msg.Raw))
+	d.appendedFlags = append(d.appendedFlags, flags)
 	return nil
 }
 

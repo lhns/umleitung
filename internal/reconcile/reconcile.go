@@ -29,11 +29,17 @@ type Store interface {
 	RecordKey(key string, uid uint32, copiedAtUnix int64) error
 	CopiedCount() (int64, error)
 	SeedBatch(keys []string) error
+	AddLabel(key, label string) error
+	LabelsFor(key string) ([]string, error)
+	FolderState(name string) (uidValidity, lastUID uint32, err error)
+	SetFolderState(name string, uidValidity, lastUID uint32) error
 }
 
 // Source is the read-only side.
 type Source interface {
 	SelectFolder() (uidValidity, uidNext, numMessages uint32, err error)
+	SelectNamedFolder(name string) (uidValidity, uidNext, numMessages uint32, err error)
+	ListFolders() ([]imapx.FolderInfo, error)
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
 	FetchFull(uid imap.UID) (*imapx.FullMessage, error)
 }
@@ -44,6 +50,7 @@ type Dest interface {
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
 	HasMessageID(messageID string) (bool, error)
 	Append(msg *imapx.FullMessage, flags []imap.Flag) error
+	SupportsArbitraryKeywords() bool
 }
 
 // Options tune the reconciler.
@@ -51,6 +58,18 @@ type Options struct {
 	UIDBatch  int  // UID window size for the windowed, resumable scan
 	DestGuard bool // per-append `SEARCH HEADER Message-ID` on the destination
 	CarrySeen bool // propagate \Seen from source
+
+	SyncLabels   bool     // record source label-folder membership -> dest keywords
+	SourceFolder string   // the mirror source folder (excluded from label scan)
+	LabelExclude []string // additional folder names excluded from the label scan
+}
+
+func (o *Options) labelExcludeSet() map[string]bool {
+	set := make(map[string]bool, len(o.LabelExclude))
+	for _, n := range o.LabelExclude {
+		set[n] = true
+	}
+	return set
 }
 
 // Summary reports what one reconcile pass did.
@@ -84,6 +103,18 @@ func New(store Store, src Source, dst Dest, opts Options, log *slog.Logger) *Rec
 // interrupt a large catch-up without tearing a message in half.
 func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 	sum := &Summary{}
+
+	// Label phase first, so labels are known by the time messages are
+	// appended. (Leaves a label folder selected; the SelectFolder below
+	// re-selects the mirror source folder.)
+	if r.opts.SyncLabels {
+		if !r.dst.SupportsArbitraryKeywords() {
+			r.log.Warn("destination does not advertise arbitrary keyword support (PERMANENTFLAGS \\*); labels may be dropped")
+		}
+		if err := r.scanLabelFolders(ctx); err != nil {
+			return sum, fmt.Errorf("label scan: %w", err)
+		}
+	}
 
 	uidValidity, uidNext, _, err := r.src.SelectFolder()
 	if err != nil {
@@ -182,9 +213,30 @@ func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 		return err
 	}
 
+	baseFlags := safeFlags(full.Flags, r.opts.CarrySeen)
+	flags := baseFlags
+	var keywords []imap.Flag
+	if r.opts.SyncLabels {
+		labels, err := r.store.LabelsFor(key)
+		if err != nil {
+			return err
+		}
+		keywords = keywordFlags(labels)
+		flags = append(append([]imap.Flag{}, baseFlags...), keywords...)
+	}
+
 	// APPEND first, record after — never the other way around.
-	if err := r.dst.Append(full, safeFlags(full.Flags, r.opts.CarrySeen)); err != nil {
-		return err
+	if err := r.dst.Append(full, flags); err != nil {
+		if len(keywords) == 0 {
+			return err
+		}
+		// The mirror always wins over label decoration: retry once without
+		// keywords before treating this as an error.
+		r.log.Warn("append with label keywords failed; retrying without keywords",
+			"uid", m.UID, "keywords", len(keywords), "err", err)
+		if err := r.dst.Append(full, baseFlags); err != nil {
+			return err
+		}
 	}
 	if err := r.store.RecordKey(key, uint32(m.UID), r.now().Unix()); err != nil {
 		return err

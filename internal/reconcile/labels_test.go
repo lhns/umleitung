@@ -1,0 +1,233 @@
+package reconcile
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"testing"
+
+	"github.com/emersion/go-imap/v2"
+
+	"github.com/lhns/umleitung/internal/imapx"
+)
+
+func TestKeywordForSanitization(t *testing.T) {
+	cases := []struct{ label, want string }{
+		{"Work", "work"},
+		{"[Werbung]", "werbung"},          // brackets trimmed
+		{"Werbung", "werbung"},            // collides with the above — documented
+		{"Bücher", "b_cher"},              // umlaut
+		{"Wichtige Mails", "wichtige_mails"},
+		{"Work/Projects", "work_projects"}, // hierarchy delimiter
+		{"$Important", "important"},        // leading reserved char
+		{`\Seen`, "seen"},                 // leading backslash
+		{"a  b//c", "a_b_c"},               // runs collapsed
+		{"---", "---"},                     // dashes are atom-safe
+		{"...", ""},                        // nothing survives -> skip
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := keywordFor(c.label); got != c.want {
+			t.Errorf("keywordFor(%q) = %q, want %q", c.label, got, c.want)
+		}
+	}
+	// Collision case is intentional: both map to the same keyword.
+	if keywordFor("[Werbung]") != keywordFor("Werbung") {
+		t.Error("bracket collision case changed — update docs")
+	}
+}
+
+func TestKeywordFlagsDedupAndSkip(t *testing.T) {
+	flags := keywordFlags([]string{"[Werbung]", "Werbung", "...", "Work"})
+	want := []imap.Flag{"werbung", "work"}
+	if !slices.Equal(flags, want) {
+		t.Fatalf("keywordFlags = %v, want %v", flags, want)
+	}
+}
+
+func TestLabelFolderExclusion(t *testing.T) {
+	exclude := map[string]bool{"Skipped": true}
+	cases := []struct {
+		f    imapx.FolderInfo
+		want bool
+	}{
+		{imapx.FolderInfo{Name: "Work"}, true},
+		{imapx.FolderInfo{Name: "Friends/Close"}, true},
+		{imapx.FolderInfo{Name: "AllMail"}, false},  // source folder
+		{imapx.FolderInfo{Name: "INBOX"}, false},    // inbox membership is not a label
+		{imapx.FolderInfo{Name: "inbox"}, false},    // case-insensitive
+		{imapx.FolderInfo{Name: "Skipped"}, false},  // LABEL_EXCLUDE
+		{imapx.FolderInfo{Name: "Parent", Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect}}, false},
+		{imapx.FolderInfo{Name: "Sent", Attrs: []imap.MailboxAttr{imap.MailboxAttrSent}}, false},
+		{imapx.FolderInfo{Name: "Trash", Attrs: []imap.MailboxAttr{imap.MailboxAttrTrash}}, false},
+		{imapx.FolderInfo{Name: "Spam", Attrs: []imap.MailboxAttr{imap.MailboxAttrJunk}}, false},
+		{imapx.FolderInfo{Name: "Everything", Attrs: []imap.MailboxAttr{imap.MailboxAttrAll}}, false},
+		{imapx.FolderInfo{Name: "Wichtig", Attrs: []imap.MailboxAttr{imap.MailboxAttrImportant}}, false},
+		{imapx.FolderInfo{Name: "Starred", Attrs: []imap.MailboxAttr{imap.MailboxAttrFlagged}}, false},
+		{imapx.FolderInfo{Name: "Drafts", Attrs: []imap.MailboxAttr{imap.MailboxAttrDrafts}}, false},
+	}
+	for _, c := range cases {
+		if got := isLabelFolder(c.f, "AllMail", exclude); got != c.want {
+			t.Errorf("isLabelFolder(%q %v) = %v, want %v", c.f.Name, c.f.Attrs, got, c.want)
+		}
+	}
+}
+
+func TestMirrorAppendsLabelKeywords(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs: []fakeMsg{
+			msg(1, "<a@x>", "raw-a"), // labeled Work + Friends/Close
+			msg(2, "<b@x>", "raw-b"), // unlabeled
+		},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work":          {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
+			"Friends/Close": {uidValidity: 72, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
+			"Sent":          {uidValidity: 73, msgs: []fakeMsg{msg(1, "<b@x>", "raw-b")}, attrs: []imap.MailboxAttr{imap.MailboxAttrSent}},
+		},
+	}
+	dst := newFakeDest()
+	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 2 {
+		t.Fatalf("copied %d, want 2", sum.Copied)
+	}
+	if want := []imap.Flag{"friends_close", "work"}; !slices.Equal(dst.appendedFlags[0], want) {
+		t.Fatalf("labeled message flags = %v, want %v", dst.appendedFlags[0], want)
+	}
+	if len(dst.appendedFlags[1]) != 0 {
+		t.Fatalf("unlabeled message got flags %v (Sent folder must be excluded)", dst.appendedFlags[1])
+	}
+}
+
+func TestLabelScanResumable(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
+		},
+	}
+	dst := newFakeDest()
+	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if v, u, _ := store.FolderState("Work"); v != 71 || u != 1 {
+		t.Fatalf("folder state = (%d, %d), want (71, 1)", v, u)
+	}
+
+	// Second run: label folder unchanged -> no meta fetches for it.
+	src.metaCalls = 0
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if src.metaCalls != 0 {
+		t.Fatalf("unchanged folders re-scanned (%d fetches)", src.metaCalls)
+	}
+
+	// UIDVALIDITY reset on the label folder -> full folder rescan, labels
+	// table stays correct (idempotent).
+	src.labelFolders["Work"].uidValidity = 99
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	labels, _ := store.LabelsFor("<a@x>")
+	if !slices.Equal(labels, []string{"Work"}) {
+		t.Fatalf("labels after rescan = %v, want [Work]", labels)
+	}
+	if v, _, _ := store.FolderState("Work"); v != 99 {
+		t.Fatalf("folder uidvalidity not updated: %d", v)
+	}
+}
+
+func TestKeywordAppendFallback(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
+		},
+	}
+	dst := newFakeDest()
+	dst.rejectKeywords = true
+	dst.noArbitraryKw = true // also exercises the warning path
+	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The message must be mirrored despite the keyword rejection: retried
+	// once without keywords, recorded, no duplicate.
+	if sum.Copied != 1 || len(dst.appended) != 1 {
+		t.Fatalf("fallback failed: %+v appended=%d", sum, len(dst.appended))
+	}
+	if len(dst.appendedFlags[0]) != 0 {
+		t.Fatalf("fallback append still carried flags: %v", dst.appendedFlags[0])
+	}
+	if !store.keys["<a@x>"] {
+		t.Fatal("message not recorded after fallback append")
+	}
+
+	// Re-run: no duplicate append attempts.
+	sum, err = rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 0 || len(dst.appended) != 1 {
+		t.Fatalf("re-run after fallback duplicated: %+v", sum)
+	}
+}
+
+func TestKeywordAppendNoRetryWhenAccepted(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
+		},
+	}
+	dst := newFakeDest()
+	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(dst.appended) != 1 {
+		t.Fatalf("appended %d times, want exactly 1 (no spurious retry)", len(dst.appended))
+	}
+	if want := []imap.Flag{"work"}; !slices.Equal(dst.appendedFlags[0], want) {
+		t.Fatalf("flags = %v, want %v", dst.appendedFlags[0], want)
+	}
+}
+
+// Guard: a failing append with keywords where the retry ALSO fails must
+// surface the error and leave the key unrecorded (retryable).
+func TestKeywordAppendFallbackBothFail(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
+		},
+	}
+	dst := newFakeDest()
+	dst.appendErr = fmt.Errorf("append always fails (injected)")
+	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+
+	if _, err := rec.Run(context.Background()); err == nil {
+		t.Fatal("want error when both appends fail")
+	}
+	if store.keys["<a@x>"] {
+		t.Fatal("key recorded despite total append failure")
+	}
+}

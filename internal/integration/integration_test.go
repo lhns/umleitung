@@ -11,6 +11,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -292,6 +295,148 @@ func TestEndToEndMirror(t *testing.T) {
 	}
 	if got := destMessages(t, dstEP); len(got) != 6 {
 		t.Fatalf("dest has %d messages after reset, want 6", len(got))
+	}
+}
+
+// TestLabelSyncEndToEnd verifies label-folder membership -> destination
+// keywords over real IMAP connections.
+func TestLabelSyncEndToEnd(t *testing.T) {
+	srcEP, srcUser := startServer(t, "source@test")
+	dstEP, _ := startServer(t, "dest@test")
+	srcEP.Folder = srcFolder
+	dstEP.Folder = dstFolder
+
+	for _, f := range []string{srcFolder, "Work", "Friends/Close", "Ignored"} {
+		if err := srcUser.Create(f, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	baseDate := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	// Message m1 carries labels Work + Friends/Close (+ one in an excluded
+	// folder), m2 carries Work, m3 carries none.
+	appendTo := func(folder string, raw []byte, date time.Time) {
+		ep := srcEP
+		ep.Folder = folder
+		appendToSource(t, ep, raw, date)
+	}
+	m1 := rawMessage("<m1@test>", "one")
+	m2 := rawMessage("<m2@test>", "two")
+	m3 := rawMessage("<m3@test>", "three")
+	appendTo(srcFolder, m1, baseDate)
+	appendTo(srcFolder, m2, baseDate.Add(time.Minute))
+	appendTo(srcFolder, m3, baseDate.Add(2*time.Minute))
+	appendTo("Work", m1, baseDate)
+	appendTo("Friends/Close", m1, baseDate)
+	appendTo("Ignored", m1, baseDate)
+	appendTo("Work", m2, baseDate.Add(time.Minute))
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	src, err := imapx.Dial(srcEP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst, err := imapx.Dial(dstEP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.EnsureFolder(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := dst.SelectFolder(); err != nil {
+		t.Fatal(err)
+	}
+	rec := reconcile.New(store, src, dst, reconcile.Options{
+		UIDBatch:     2,
+		DestGuard:    true,
+		SyncLabels:   true,
+		SourceFolder: srcFolder,
+		LabelExclude: []string{"Ignored"},
+	}, slog.New(slog.DiscardHandler))
+
+	ctx := context.Background()
+	sum, err := rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 3 {
+		t.Fatalf("copied %d, want 3", sum.Copied)
+	}
+
+	// Collect keywords per Message-ID from the destination over IMAP.
+	keywordsByMID := func() map[string][]string {
+		out := map[string][]string{}
+		checker, err := imapx.Dial(dstEP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer checker.Close()
+		_, uidNext, _, err := checker.SelectFolder()
+		if err != nil {
+			t.Fatal(err)
+		}
+		metas, err := checker.FetchMetaRange(1, imap.UID(uidNext-1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range metas {
+			full, err := checker.FetchFull(m.UID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var kws []string
+			for _, f := range full.Flags {
+				if !strings.HasPrefix(string(f), `\`) { // skip system flags, keep keywords
+					kws = append(kws, string(f))
+				}
+			}
+			sort.Strings(kws)
+			out[m.MessageID] = kws
+		}
+		return out
+	}
+
+	got := keywordsByMID()
+	if want := []string{"friends_close", "work"}; !slices.Equal(got["<m1@test>"], want) {
+		t.Fatalf("m1 keywords = %v, want %v (Ignored folder must not contribute)", got["<m1@test>"], want)
+	}
+	if want := []string{"work"}; !slices.Equal(got["<m2@test>"], want) {
+		t.Fatalf("m2 keywords = %v, want %v", got["<m2@test>"], want)
+	}
+	if len(got["<m3@test>"]) != 0 {
+		t.Fatalf("m3 keywords = %v, want none", got["<m3@test>"])
+	}
+
+	// Re-run: no new appends, keywords unchanged.
+	sum, err = rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 0 {
+		t.Fatalf("re-run copied %d", sum.Copied)
+	}
+
+	// New labeled mail arrives -> mirrored with its keyword.
+	m4 := rawMessage("<m4@test>", "four")
+	appendTo("Work", m4, baseDate.Add(3*time.Minute))
+	appendTo(srcFolder, m4, baseDate.Add(3*time.Minute))
+	sum, err = rec.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 1 {
+		t.Fatalf("incremental copied %d, want 1", sum.Copied)
+	}
+	got = keywordsByMID()
+	if want := []string{"work"}; !slices.Equal(got["<m4@test>"], want) {
+		t.Fatalf("m4 keywords = %v, want %v", got["<m4@test>"], want)
 	}
 }
 

@@ -57,12 +57,43 @@ variants pointing at a file (Docker/Swarm secrets).
 | `DEST_GUARD` | `true` | Per-append `SEARCH HEADER Message-ID` on destination |
 | `UID_BATCH` | `2000` | UID window size for the windowed, resumable scan |
 | `CARRY_SEEN` | `true` | Propagate `\Seen` from source (no other flags/keywords are ever copied) |
+| `SYNC_LABELS` | `false` | Mirror source label-folder membership as destination keywords (see below) |
+| `LABEL_EXCLUDE` | — | Comma-separated folder names to exclude from the label scan |
 | `HEALTH_ADDR` | `:8080` | `/healthz` liveness endpoint; empty disables |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
 Tip: pick a dedicated destination folder (e.g. `Mirror`) rather than `INBOX`
 or `Archive` — mirrored mail stays clearly separated from natively-delivered
 mail and folder semantics stay clean.
+
+## Label sync (`SYNC_LABELS=true`, optional)
+
+Label-based servers (notably Gmail) expose each user label as an IMAP
+folder — a message with N labels appears in N folders. With `SYNC_LABELS=true`
+Umleiter scans those folders (incrementally, same resumable machinery as the
+mirror itself) and appends each message with its labels attached as **IMAP
+keywords** on the destination.
+
+- **Nothing to create on the destination, ever.** IMAP keywords have no
+  server-side registry; a keyword exists on a message by being set on it.
+  Stalwart stores them as JMAP keywords automatically.
+- **Client visibility varies:** Thunderbird shows keywords as tags once you
+  define a tag with a matching key (one-time, cosmetic — Settings → Tags);
+  JMAP/webmail clients generally show them automatically; most mobile IMAP
+  clients ignore them (they stay on the server).
+- **Keyword names are sanitized:** IMAP flags must be ASCII atoms, so labels
+  are mapped like `[Werbung]` → `werbung`, `Work/Projects` → `work_projects`,
+  `Bücher` → `b_cher` (lowercased — IMAP flags are case-insensitive).
+  Distinct labels can collide after sanitization; harmless.
+- **Captured at copy time:** label changes made after a message was mirrored
+  are not propagated (append-only design; retroactive backfill may come
+  later).
+- **Labels never break the mirror:** if the destination rejects an APPEND
+  with keywords, the message is retried once without them — the copy always
+  wins over the tags.
+- Excluded automatically: the source folder, `INBOX`, and special-use folders
+  (Sent, Trash, Junk, All Mail, Starred, Important, Drafts, Archive). Add
+  more via `LABEL_EXCLUDE=Notes,Some/Other`.
 
 ## Deployment
 
@@ -129,6 +160,12 @@ stack pins `replicas: 1` — keep it that way.
   2FA). Gmail caps IMAP download at roughly ~2.5 GB/day — the first full
   mirror of years of mail may take days; this is a quota, not a bug. Gmail
   also force-drops IDLE connections after ~29 minutes; handled automatically.
+  Gmail **labels** appear as IMAP folders → `SYNC_LABELS=true` mirrors them
+  as keywords. Gmail **categories** (Primary/Allgemein, Promotions/Werbung,
+  Social, Updates, Forums) are *not* labels and *not* folders — they are not
+  exposed over standard IMAP at all (only via Gmail-proprietary extensions or
+  the OAuth REST API) and cannot be synced; they also mean nothing to clients
+  outside Gmail. See ADR 0010.
 - **Stalwart as destination:** use a Stalwart *application password* (not the
   directory/LDAP password, not OAuth).
 

@@ -6,6 +6,7 @@ package imapx
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -34,11 +35,21 @@ type FullMessage struct {
 	InternalDate time.Time
 }
 
+// FolderInfo describes one folder returned by LIST.
+type FolderInfo struct {
+	Name  string
+	Attrs []imap.MailboxAttr
+}
+
 // Client is one IMAPS connection to a configured endpoint.
 type Client struct {
 	ep     config.Endpoint
 	c      *imapclient.Client
 	notify chan struct{}
+
+	// arbitraryKeywords records whether the last SELECTed mailbox advertised
+	// PERMANENTFLAGS \* (arbitrary keywords storable).
+	arbitraryKeywords bool
 }
 
 // Dial connects with TLS, waits for the greeting and logs in with LOGIN.
@@ -88,11 +99,36 @@ func (cl *Client) Notify() <-chan struct{} { return cl.notify }
 // SelectFolder selects the endpoint's folder and returns its UIDVALIDITY,
 // UIDNEXT and message count.
 func (cl *Client) SelectFolder() (uidValidity uint32, uidNext uint32, numMessages uint32, err error) {
-	data, err := cl.c.Select(cl.ep.Folder, nil).Wait()
+	return cl.SelectNamedFolder(cl.ep.Folder)
+}
+
+// SelectNamedFolder selects an arbitrary folder (used by the label scan) and
+// returns its UIDVALIDITY, UIDNEXT and message count.
+func (cl *Client) SelectNamedFolder(name string) (uidValidity uint32, uidNext uint32, numMessages uint32, err error) {
+	data, err := cl.c.Select(name, nil).Wait()
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("select %q on %s: %w", cl.ep.Folder, cl.ep.Addr(), err)
+		return 0, 0, 0, fmt.Errorf("select %q on %s: %w", name, cl.ep.Addr(), err)
 	}
+	cl.arbitraryKeywords = slices.Contains(data.PermanentFlags, imap.FlagWildcard)
 	return data.UIDValidity, uint32(data.UIDNext), data.NumMessages, nil
+}
+
+// SupportsArbitraryKeywords reports whether the most recently selected folder
+// advertised PERMANENTFLAGS \* (arbitrary keywords may be stored).
+func (cl *Client) SupportsArbitraryKeywords() bool { return cl.arbitraryKeywords }
+
+// ListFolders lists all folders on the server.
+func (cl *Client) ListFolders() ([]FolderInfo, error) {
+	cmd := cl.c.List("", "*", nil)
+	data, err := cmd.Collect()
+	if err != nil {
+		return nil, fmt.Errorf("list folders on %s: %w", cl.ep.Addr(), err)
+	}
+	folders := make([]FolderInfo, 0, len(data))
+	for _, d := range data {
+		folders = append(folders, FolderInfo{Name: d.Mailbox, Attrs: d.Attrs})
+	}
+	return folders, nil
 }
 
 // EnsureFolder creates the endpoint's folder if it does not exist yet.

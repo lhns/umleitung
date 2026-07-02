@@ -41,7 +41,8 @@ func main() {
 		"source", cfg.Source.Addr(), "source_folder", cfg.Source.Folder,
 		"dest", cfg.Dest.Addr(), "dest_folder", cfg.Dest.Folder,
 		"poll_interval", cfg.PollInterval, "seed_dest", string(cfg.SeedDest),
-		"dest_guard", cfg.DestGuard, "uid_batch", cfg.UIDBatch)
+		"dest_guard", cfg.DestGuard, "uid_batch", cfg.UIDBatch,
+		"sync_labels", cfg.SyncLabels)
 
 	// Cross-process guard: refuse to start if another instance holds the
 	// state volume. Two syncers would double-append.
@@ -121,9 +122,12 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 	}
 
 	rec := reconcile.New(store, src, dst, reconcile.Options{
-		UIDBatch:  cfg.UIDBatch,
-		DestGuard: cfg.DestGuard,
-		CarrySeen: cfg.CarrySeen,
+		UIDBatch:     cfg.UIDBatch,
+		DestGuard:    cfg.DestGuard,
+		CarrySeen:    cfg.CarrySeen,
+		SyncLabels:   cfg.SyncLabels,
+		SourceFolder: cfg.Source.Folder,
+		LabelExclude: cfg.LabelExclude,
 	}, log)
 
 	// Destination seeding: bootstrap the dedup set from what the destination

@@ -18,6 +18,7 @@ services:
       DEST_USER: "user@example.org"
       DEST_PASSWORD_FILE: /run/secrets/umleiter_dest_password
       DEST_FOLDER: "Mirror"
+      # SYNC_LABELS: "true"          # mirror label-folder membership as keywords
       # POLL_INTERVAL: "900"
     volumes:
       # State volume = dedup fast path. Persistent bind mount; back it up

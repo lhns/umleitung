@@ -48,6 +48,9 @@ type Config struct {
 	UIDBatch  int
 	CarrySeen bool
 
+	SyncLabels   bool     // mirror source label-folder membership as dest keywords
+	LabelExclude []string // folder names excluded from the label scan
+
 	HealthAddr string // empty = disabled
 	LogLevel   string
 }
@@ -92,6 +95,20 @@ func Load() (*Config, error) {
 		return n
 	}
 
+	csv := func(name string) []string {
+		v := os.Getenv(name)
+		if v == "" {
+			return nil
+		}
+		var out []string
+		for part := range strings.SplitSeq(v, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+
 	boolean := func(name string, def bool) bool {
 		v, ok := os.LookupEnv(name)
 		if !ok || v == "" {
@@ -130,6 +147,8 @@ func Load() (*Config, error) {
 		DestGuard:    boolean("DEST_GUARD", true),
 		UIDBatch:     num("UID_BATCH", 2000),
 		CarrySeen:    boolean("CARRY_SEEN", true),
+		SyncLabels:   boolean("SYNC_LABELS", false),
+		LabelExclude: csv("LABEL_EXCLUDE"),
 		HealthAddr:   str("HEALTH_ADDR", ":8080"),
 		LogLevel:     strings.ToLower(str("LOG_LEVEL", "info")),
 	}

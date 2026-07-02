@@ -90,6 +90,59 @@ func TestRecordKeyIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestLabelsRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	if err := s.AddLabel("<a@x>", "Work"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddLabel("<a@x>", "Work"); err != nil {
+		t.Fatalf("re-add errored: %v", err)
+	}
+	if err := s.AddLabel("<a@x>", "Friends/Close"); err != nil {
+		t.Fatal(err)
+	}
+	labels, err := s.LabelsFor("<a@x>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(labels) != 2 || labels[0] != "Friends/Close" || labels[1] != "Work" {
+		t.Fatalf("labels = %v, want sorted [Friends/Close Work]", labels)
+	}
+	if labels, _ := s.LabelsFor("<unknown@x>"); len(labels) != 0 {
+		t.Fatalf("unknown key returned labels: %v", labels)
+	}
+}
+
+func TestFolderStateRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, u, err := s.FolderState("Work"); err != nil || v != 0 || u != 0 {
+		t.Fatalf("fresh folder state = (%d, %d, %v), want zeros", v, u, err)
+	}
+	if err := s.SetFolderState("Work", 42, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFolderState("Work", 42, 200); err != nil { // overwrite
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if v, u, _ := s2.FolderState("Work"); v != 42 || u != 200 {
+		t.Fatalf("folder state lost across reopen: (%d, %d)", v, u)
+	}
+}
+
 func TestSeedBatch(t *testing.T) {
 	s := openTemp(t)
 	if err := s.RecordKey("<pre@x>", 1, 1); err != nil {

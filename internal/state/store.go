@@ -22,6 +22,16 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS labels (
+	message_id TEXT NOT NULL,
+	label      TEXT NOT NULL,
+	PRIMARY KEY (message_id, label)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS folders (
+	name        TEXT PRIMARY KEY,
+	uidvalidity INTEGER NOT NULL DEFAULT 0,
+	last_uid    INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
 `
 
 // Store is the persistent sync state. Safe for a single process (Umleiter
@@ -116,6 +126,51 @@ func (s *Store) CopiedCount() (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM copied`).Scan(&n)
 	return n, err
+}
+
+// AddLabel records that the message with the given dedup key carries a label
+// (source label-folder membership). Idempotent.
+func (s *Store) AddLabel(key, label string) error {
+	_, err := s.db.Exec(`INSERT INTO labels (message_id, label) VALUES (?, ?)
+		ON CONFLICT(message_id, label) DO NOTHING`, key, label)
+	return err
+}
+
+// LabelsFor returns the labels recorded for a dedup key, sorted.
+func (s *Store) LabelsFor(key string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT label FROM labels WHERE message_id = ? ORDER BY label`, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var labels []string
+	for rows.Next() {
+		var l string
+		if err := rows.Scan(&l); err != nil {
+			return nil, err
+		}
+		labels = append(labels, l)
+	}
+	return labels, rows.Err()
+}
+
+// FolderState returns the per-folder UIDVALIDITY and UID high-water mark used
+// by the label scan (0, 0 if the folder was never scanned).
+func (s *Store) FolderState(name string) (uidValidity, lastUID uint32, err error) {
+	var v, u uint32
+	err = s.db.QueryRow(`SELECT uidvalidity, last_uid FROM folders WHERE name = ?`, name).Scan(&v, &u)
+	if err == sql.ErrNoRows {
+		return 0, 0, nil
+	}
+	return v, u, err
+}
+
+// SetFolderState stores the per-folder UIDVALIDITY and UID high-water mark.
+func (s *Store) SetFolderState(name string, uidValidity, lastUID uint32) error {
+	_, err := s.db.Exec(`INSERT INTO folders (name, uidvalidity, last_uid) VALUES (?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET uidvalidity = excluded.uidvalidity, last_uid = excluded.last_uid`,
+		name, uidValidity, lastUID)
+	return err
 }
 
 // SeedBatch inserts a batch of dedup keys inside one transaction (used when

@@ -16,6 +16,8 @@ services:
       DEST_PASSWORD: "${DEST_PASSWORD}"
       DEST_FOLDER: "Mirror"
       # All other settings have sensible defaults; override as needed:
+      # SYNC_LABELS: "true"          # mirror label-folder membership as keywords
+      # LABEL_EXCLUDE: "Notes"       # folders to skip in the label scan
       # POLL_INTERVAL: "900"
       # LOG_LEVEL: "info"
     volumes:
