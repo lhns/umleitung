@@ -296,17 +296,19 @@ func (cl *Client) SearchMessageIDsIn(folder string, ids []string) (map[string]bo
 	return found, nil
 }
 
-// orMessageIDCriteria builds `HEADER Message-Id a OR ... OR z` as the nested
-// OR-pair tree the IMAP grammar requires.
+// orMessageIDCriteria builds `OR ... OR HEADER Message-Id x ...` as a
+// BALANCED OR-pair tree: servers cap filter nesting depth (Stalwart rejects
+// deep chains with "BAD Too many nested filters"), and a balanced tree keeps
+// depth at log2(N) — 7 levels for a 100-id chunk instead of 99.
 func orMessageIDCriteria(ids []string) *imap.SearchCriteria {
-	single := imap.SearchCriteria{
-		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: ids[0]}},
-	}
 	if len(ids) == 1 {
-		return &single
+		return &imap.SearchCriteria{
+			Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: ids[0]}},
+		}
 	}
+	mid := len(ids) / 2
 	return &imap.SearchCriteria{
-		Or: [][2]imap.SearchCriteria{{single, *orMessageIDCriteria(ids[1:])}},
+		Or: [][2]imap.SearchCriteria{{*orMessageIDCriteria(ids[:mid]), *orMessageIDCriteria(ids[mid:])}},
 	}
 }
 

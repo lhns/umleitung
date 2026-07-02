@@ -1,6 +1,11 @@
 package imapx
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+
+	"github.com/emersion/go-imap/v2"
+)
 
 func TestParseMetaHeader(t *testing.T) {
 	hdr := []byte("Message-Id: <abc@example.com>\r\n" +
@@ -47,7 +52,7 @@ func TestOrMessageIDCriteria(t *testing.T) {
 	if len(c2.Or) != 1 || c2.Or[0][0].Header[0].Value != "<a@x>" || c2.Or[0][1].Header[0].Value != "<b@x>" {
 		t.Fatalf("pair: %+v", c2)
 	}
-	// 3 ids: nested OR tree, rightmost leaf carries the last id.
+	// 3 ids: balanced — left leaf a, right subtree OR(b, c).
 	c3 := orMessageIDCriteria([]string{"<a@x>", "<b@x>", "<c@x>"})
 	if len(c3.Or) != 1 || c3.Or[0][0].Header[0].Value != "<a@x>" {
 		t.Fatalf("tree root: %+v", c3)
@@ -56,6 +61,44 @@ func TestOrMessageIDCriteria(t *testing.T) {
 	if len(inner.Or) != 1 || inner.Or[0][0].Header[0].Value != "<b@x>" || inner.Or[0][1].Header[0].Value != "<c@x>" {
 		t.Fatalf("tree inner: %+v", inner)
 	}
+
+	// A full guard chunk must stay shallow: servers cap filter nesting depth
+	// (Stalwart: "BAD Too many nested filters" — seen in production with the
+	// previous 99-deep linear chain).
+	ids := make([]string, 100)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("<m%d@x>", i)
+	}
+	if d := orDepth(orMessageIDCriteria(ids)); d > 8 {
+		t.Fatalf("OR-tree depth = %d for 100 ids, want <= 8 (balanced)", d)
+	}
+	// All leaves present exactly once.
+	leaves := map[string]int{}
+	countLeaves(orMessageIDCriteria(ids), leaves)
+	if len(leaves) != 100 {
+		t.Fatalf("leaves = %d, want 100", len(leaves))
+	}
+	for id, n := range leaves {
+		if n != 1 {
+			t.Fatalf("leaf %s appears %d times", id, n)
+		}
+	}
+}
+
+func orDepth(c *imap.SearchCriteria) int {
+	if len(c.Or) == 0 {
+		return 1
+	}
+	return 1 + max(orDepth(&c.Or[0][0]), orDepth(&c.Or[0][1]))
+}
+
+func countLeaves(c *imap.SearchCriteria, leaves map[string]int) {
+	if len(c.Or) == 0 {
+		leaves[c.Header[0].Value]++
+		return
+	}
+	countLeaves(&c.Or[0][0], leaves)
+	countLeaves(&c.Or[0][1], leaves)
 }
 
 func TestParseMetaHeaderEmpty(t *testing.T) {
