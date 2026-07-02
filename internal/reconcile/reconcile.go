@@ -9,6 +9,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -357,6 +358,15 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 		uids = append(uids, p.uid)
 	}
 
+	// With the destination guard disabled there is no layer that re-detects
+	// appended-but-unrecorded messages after a crash — degrade to the strict
+	// synchronous mode (1 in-flight append, record flushed per message) so
+	// the crash window stays at a single message.
+	ringLimit, flushLimit := appendRing, recordFlushSize
+	if !r.opts.DestGuard {
+		ringLimit, flushLimit = 1, 1
+	}
+
 	ch := make(chan copyItem, pipelineDepth)
 	failed := make(chan struct{}) // closed by consumer on first error
 	done := make(chan struct{})
@@ -389,13 +399,18 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 			it := ring[0]
 			ring = ring[1:]
 			if err := it.pa.Wait(); err != nil {
-				if !it.hadKeywords {
+				// The keyword-less retry is only safe when the SERVER
+				// rejected the append (tagged NO/BAD = definitely not
+				// stored). On a connection-level error the append may have
+				// landed — retrying could duplicate; abort instead and let
+				// the destination guard reconcile on the next pass.
+				if !it.hadKeywords || !isServerReject(err) {
 					fail(fmt.Errorf("uid %d: %w", it.pc.uid, err))
 					return
 				}
 				// The mirror always wins over label decoration: retry once
 				// without keywords before treating this as an error.
-				r.log.Warn("append with label keywords failed; retrying without keywords",
+				r.log.Warn("append with label keywords rejected; retrying without keywords",
 					"uid", it.pc.uid, "err", err)
 				if err := r.dst.AppendTo(it.pc.destFolder, it.full, it.baseFlags); err != nil {
 					fail(fmt.Errorf("uid %d: %w", it.pc.uid, err))
@@ -409,7 +424,7 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 			// Every copy: keeps the heartbeat fresh and progress lines
 			// flowing even when the provider bandwidth-shapes the stream.
 			r.opts.progress("mirror", "", sum.Copied)
-			if len(records) >= recordFlushSize {
+			if len(records) >= flushLimit {
 				flushRecords()
 			}
 		}
@@ -439,7 +454,7 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 				pa: pa, pc: it.pc, full: it.full,
 				baseFlags: baseFlags, hadKeywords: len(keywords) > 0,
 			})
-			if len(ring) >= appendRing {
+			if len(ring) >= ringLimit {
 				settleOldest()
 			}
 		}
@@ -473,6 +488,14 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 		return prodErr
 	}
 	return ctx.Err()
+}
+
+// isServerReject reports whether err is a tagged server response (NO/BAD):
+// the server processed the command and definitively did NOT store the
+// message, making a retry safe. Connection-level errors return false.
+func isServerReject(err error) bool {
+	var imapErr *imap.Error
+	return errors.As(err, &imapErr)
 }
 
 // safeFlags builds the flag set for the destination APPEND: optionally carry

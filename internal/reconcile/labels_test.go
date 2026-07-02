@@ -209,6 +209,58 @@ func TestKeywordAppendNoRetryWhenAccepted(t *testing.T) {
 	}
 }
 
+// A CONNECTION-level append failure must NOT trigger the keyword-less retry:
+// the original append may have landed server-side, and retrying could
+// duplicate. The pass aborts; the destination guard reconciles next run.
+func TestKeywordRetryOnlyOnServerReject(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
+		},
+	}
+	dst := newFakeDest()
+	dst.appendErr = fmt.Errorf("connection reset (injected)") // NOT a tagged server response
+	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+
+	if _, err := rec.Run(context.Background()); err == nil {
+		t.Fatal("want pass abort on connection-level append error")
+	}
+	if len(dst.appended) != 0 {
+		t.Fatalf("retry appended despite ambiguous failure: %d", len(dst.appended))
+	}
+	if store.keys["<a@x>"] {
+		t.Fatal("key recorded despite unconfirmed append")
+	}
+}
+
+// With the destination guard disabled there is no re-detection layer, so the
+// pipeline must degrade to strict per-message record flushing (crash window
+// of one message, as before the batching optimizations).
+func TestGuardOffDegradesToSynchronousRecords(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{uidValidity: 7, msgs: []fakeMsg{
+		msg(1, "<a@x>", "raw-a"), msg(2, "<b@x>", "raw-b"), msg(3, "<c@x>", "raw-c"),
+	}}
+	dst := newFakeDest()
+	dst.failAppendAt = 3
+	rec := newRec(store, src, dst, Options{DestGuard: false})
+
+	if _, err := rec.Run(context.Background()); err == nil {
+		t.Fatal("want error from failed append")
+	}
+	// Both successfully appended messages must ALREADY be recorded — no
+	// batched records pending at crash time when the guard is off.
+	if !store.keys["<a@x>"] || !store.keys["<b@x>"] {
+		t.Fatalf("records not flushed per message with guard off: %v", store.keys)
+	}
+	if store.keys["<c@x>"] {
+		t.Fatal("failed append recorded")
+	}
+}
+
 // Guard: a failing append with keywords where the retry ALSO fails must
 // surface the error and leave the key unrecorded (retryable).
 func TestKeywordAppendFallbackBothFail(t *testing.T) {

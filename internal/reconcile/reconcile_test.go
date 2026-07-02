@@ -377,7 +377,8 @@ func (d *fakeDest) AppendTo(folder string, msg *imapx.FullMessage, flags []imap.
 	if d.rejectKeywords {
 		for _, f := range flags {
 			if f != imap.FlagSeen {
-				return fmt.Errorf("keyword %q not permitted (injected)", f)
+				// A tagged server rejection (definitely not stored).
+				return &imap.Error{Type: imap.StatusResponseTypeNo, Text: fmt.Sprintf("keyword %q not permitted (injected)", f)}
 			}
 		}
 	}
