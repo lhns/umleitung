@@ -340,7 +340,6 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 
 	go func() {
 		defer close(done)
-		copied := 0
 		for it := range ch {
 			if consErr != nil {
 				continue // drain so the producer never blocks
@@ -351,10 +350,10 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 				continue
 			}
 			sum.Copied++
-			copied++
-			if copied%200 == 0 {
-				r.opts.progress("mirror", "", sum.Copied)
-			}
+			// Every copy: keeps the heartbeat fresh and progress lines
+			// flowing even when the provider bandwidth-shapes the stream
+			// (the caller throttles actual log output).
+			r.opts.progress("mirror", "", sum.Copied)
 		}
 	}()
 
