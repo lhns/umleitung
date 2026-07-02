@@ -61,6 +61,9 @@ func TestMinimalConfigGetsAllDefaults(t *testing.T) {
 	if m.Labels.Enabled || m.Labels.Propagate {
 		t.Fatalf("labels defaults: %+v", m.Labels)
 	}
+	if m.Sent.Enabled || m.Sent.Folder != "Sent" || m.Sent.SourceFolder != `\Sent` {
+		t.Fatalf("sent defaults: %+v", m.Sent)
+	}
 }
 
 func TestHealthAddrExplicitNullDisables(t *testing.T) {
@@ -181,6 +184,8 @@ mirrors:
 `, "not both"},
 		{"propagate without enabled", minimal + "    labels: { propagate: true }\n", "labels.propagate requires"},
 		{"archive folder clash", minimal + "    archive: { enabled: true, folder: INBOX }\n", "must differ from dest.folder"},
+		{"sent folder clash dest", minimal + "    sent: { enabled: true, folder: INBOX }\n", "sent.folder must differ from dest.folder"},
+		{"sent folder clash archive", minimal + "    archive: { enabled: true }\n    sent: { enabled: true, folder: Archive }\n", "sent.folder must differ from archive.folder"},
 		{"unknown key (typo)", "helth_addr: ':8080'\n" + minimal, "field helth_addr not found"},
 		{"bad duration", minimal + "    poll_interval: soon\n", "invalid duration"},
 		{"dup state path", `

@@ -65,7 +65,7 @@ type Dest interface {
 	SearchMessageIDsIn(folder string, ids []string) (map[string]bool, error)
 	AppendTo(folder string, msg *imapx.FullMessage, flags []imap.Flag) error
 	MoveMessageID(fromFolder, toFolder, messageID string) (bool, error)
-	MoveUIDs(uids []imap.UID, toFolder string) error
+	MoveUIDs(fromFolder string, uids []imap.UID, toFolder string) error
 	StoreKeywordByMessageID(folder, messageID string, add bool, kw imap.Flag) (bool, error)
 	StoreKeywordsUIDs(uids []imap.UID, kws []imap.Flag) error
 	SupportsArbitraryKeywords() bool
@@ -85,6 +85,9 @@ type Options struct {
 	ArchiveRouting bool   // route by source-INBOX membership; propagate archive moves
 	SourceInbox    string // source folder whose membership means "in inbox"
 	ArchiveFolder  string // destination folder for archived mail
+	SentRouting    bool   // route by source-Sent membership; propagate moves
+	SentSrcFolder  string // resolved source folder whose membership means "sent"
+	SentFolder     string // destination folder for sent mail
 	LabelPropagate bool   // STORE keyword changes for post-copy label changes
 
 	// OnProgress, if set, is called after every committed work window in any
@@ -117,6 +120,7 @@ type Summary struct {
 	SkippedDup         int
 	MovedToArchive     int
 	MovedToInbox       int
+	MovedToSent        int
 	KeywordsUpdated    int
 }
 
@@ -217,8 +221,8 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 		return sum, fmt.Errorf("backfill: %w", err)
 	}
 
-	// Apply queued destination mutations (archive moves, keyword updates).
-	if r.opts.ArchiveRouting || r.opts.LabelPropagate {
+	// Apply queued destination mutations (routing moves, keyword updates).
+	if r.opts.ArchiveRouting || r.opts.SentRouting || r.opts.LabelPropagate {
 		if err := r.propagate(ctx, sum); err != nil {
 			return sum, fmt.Errorf("propagate: %w", err)
 		}
@@ -282,11 +286,7 @@ func (r *Reconciler) mirrorWindow(ctx context.Context, metas []imapx.MsgMeta, su
 		}
 		found := map[string]bool{}
 		if len(ids) > 0 {
-			folders := []string{r.opts.DestFolder}
-			if r.opts.ArchiveRouting {
-				folders = append(folders, r.opts.ArchiveFolder)
-			}
-			for _, folder := range folders {
+			for _, folder := range r.destBucketFolders() {
 				f, err := r.dst.SearchMessageIDsIn(folder, ids)
 				if err != nil {
 					return err
@@ -429,10 +429,7 @@ func safeFlags(src []imap.Flag, carrySeen bool) []imap.Flag {
 // BOTH destination folders are scanned. Memory stays bounded: one UID window
 // of header metadata at a time.
 func (r *Reconciler) SeedFromDest(ctx context.Context) (int64, error) {
-	folders := []string{r.opts.DestFolder}
-	if r.opts.ArchiveRouting {
-		folders = append(folders, r.opts.ArchiveFolder)
-	}
+	folders := r.destBucketFolders()
 	var seeded int64
 	for i, folder := range folders {
 		n, err := r.seedFromDestFolder(ctx, folder, fmt.Sprintf("%s %d/%d", folder, i+1, len(folders)))

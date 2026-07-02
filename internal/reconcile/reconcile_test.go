@@ -248,6 +248,7 @@ func (f *fakeSource) FetchFullStream(uids []imap.UID, fn func(*imapx.FullMessage
 const (
 	fakeDestFolder    = "DEST"
 	fakeArchiveFolder = "ARCHIVE"
+	fakeSentFolder    = "SENT-DEST"
 )
 
 type destMsg struct {
@@ -371,13 +372,13 @@ func (d *fakeDest) MoveMessageID(fromFolder, toFolder, mid string) (bool, error)
 	}
 	return false, nil
 }
-func (d *fakeDest) MoveUIDs(uids []imap.UID, toFolder string) error {
+func (d *fakeDest) MoveUIDs(fromFolder string, uids []imap.UID, toFolder string) error {
 	want := map[uint32]bool{}
 	for _, u := range uids {
 		want[uint32(u)] = true
 	}
 	var keep []*destMsg
-	for _, m := range d.folders[d.selected] {
+	for _, m := range d.folders[fromFolder] {
 		if want[m.uid] {
 			d.nextUID[toFolder]++
 			moved := *m
@@ -388,7 +389,7 @@ func (d *fakeDest) MoveUIDs(uids []imap.UID, toFolder string) error {
 			keep = append(keep, m)
 		}
 	}
-	d.folders[d.selected] = keep
+	d.folders[fromFolder] = keep
 	return nil
 }
 func (d *fakeDest) StoreKeywordByMessageID(folder, mid string, add bool, kw imap.Flag) (bool, error) {
@@ -447,12 +448,20 @@ func newRec(store Store, src Source, dst Dest, opts Options) *Reconciler {
 	if opts.DestFolder == "" {
 		opts.DestFolder = fakeDestFolder
 	}
-	if opts.ArchiveRouting {
+	if opts.ArchiveRouting || opts.SentRouting {
 		if opts.SourceInbox == "" {
 			opts.SourceInbox = "INBOX"
 		}
-		if opts.ArchiveFolder == "" {
-			opts.ArchiveFolder = fakeArchiveFolder
+	}
+	if opts.ArchiveRouting && opts.ArchiveFolder == "" {
+		opts.ArchiveFolder = fakeArchiveFolder
+	}
+	if opts.SentRouting {
+		if opts.SentSrcFolder == "" {
+			opts.SentSrcFolder = "SENTSRC"
+		}
+		if opts.SentFolder == "" {
+			opts.SentFolder = fakeSentFolder
 		}
 	}
 	return New(store, src, dst, opts, slog.New(slog.DiscardHandler))

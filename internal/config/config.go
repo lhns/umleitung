@@ -50,6 +50,7 @@ type Mirror struct {
 	Source       Endpoint
 	Dest         Endpoint
 	Archive      Archive
+	Sent         Sent
 	Labels       Labels
 }
 
@@ -71,6 +72,13 @@ func (e Endpoint) Addr() string { return fmt.Sprintf("%s:%d", e.Host, e.Port) }
 type Archive struct {
 	Enabled bool
 	Folder  string
+}
+
+// Sent groups the sent-routing settings.
+type Sent struct {
+	Enabled      bool
+	Folder       string // destination folder for sent mail
+	SourceFolder string // source folder whose membership means "sent" (selector or name)
 }
 
 // Labels groups the label-sync settings.
@@ -133,6 +141,7 @@ type rawMirror struct {
 	Source       rawEndpoint `yaml:"source"`
 	Dest         rawEndpoint `yaml:"dest"`
 	Archive      rawArchive  `yaml:"archive"`
+	Sent         rawSent     `yaml:"sent"`
 	Labels       rawLabels   `yaml:"labels"`
 }
 
@@ -150,6 +159,12 @@ type rawEndpoint struct {
 type rawArchive struct {
 	Enabled bool   `yaml:"enabled"`
 	Folder  string `yaml:"folder"`
+}
+
+type rawSent struct {
+	Enabled      bool   `yaml:"enabled"`
+	Folder       string `yaml:"folder"`
+	SourceFolder string `yaml:"source_folder"`
 }
 
 type rawLabels struct {
@@ -223,6 +238,11 @@ func resolve(raw *rawConfig) (*Config, error) {
 				Enabled: rm.Archive.Enabled,
 				Folder:  defaultStr(rm.Archive.Folder, "Archive"),
 			},
+			Sent: Sent{
+				Enabled:      rm.Sent.Enabled,
+				Folder:       defaultStr(rm.Sent.Folder, "Sent"),
+				SourceFolder: defaultStr(rm.Sent.SourceFolder, `\Sent`),
+			},
 			Labels: Labels{
 				Enabled:   rm.Labels.Enabled,
 				Propagate: rm.Labels.Propagate,
@@ -265,6 +285,14 @@ func resolve(raw *rawConfig) (*Config, error) {
 		}
 		if m.Archive.Enabled && m.Archive.Folder == m.Dest.Folder {
 			fail("%s: archive.folder must differ from dest.folder", where)
+		}
+		if m.Sent.Enabled {
+			if m.Sent.Folder == m.Dest.Folder {
+				fail("%s: sent.folder must differ from dest.folder", where)
+			}
+			if m.Archive.Enabled && m.Sent.Folder == m.Archive.Folder {
+				fail("%s: sent.folder must differ from archive.folder", where)
+			}
 		}
 		if m.UIDBatch < 1 {
 			fail("%s: uid_batch must be >= 1", where)

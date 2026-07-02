@@ -28,7 +28,7 @@ func Run(ctx context.Context, m config.Mirror, log *slog.Logger, heartbeat *atom
 		"poll_interval", m.PollInterval, "seed", string(m.Seed),
 		"dest_guard", m.DestGuard, "uid_batch", m.UIDBatch,
 		"labels", m.Labels.Enabled, "label_propagate", m.Labels.Propagate,
-		"archive", m.Archive.Enabled)
+		"archive", m.Archive.Enabled, "sent", m.Sent.Enabled)
 
 	store, err := state.Open(m.StatePath)
 	if err != nil {
@@ -82,6 +82,15 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 	if srcFolder != m.Source.Folder {
 		log.Info("resolved special-use source folder", "selector", m.Source.Folder, "folder", srcFolder)
 	}
+	var sentSrcFolder string
+	if m.Sent.Enabled {
+		if sentSrcFolder, err = src.ResolveFolder(m.Sent.SourceFolder); err != nil {
+			return err
+		}
+		if sentSrcFolder != m.Sent.SourceFolder {
+			log.Info("resolved special-use sent folder", "selector", m.Sent.SourceFolder, "folder", sentSrcFolder)
+		}
+	}
 
 	dst, err := imapx.Dial(m.Dest)
 	if err != nil {
@@ -94,6 +103,11 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 	}
 	if m.Archive.Enabled {
 		if err := dst.EnsureNamedFolder(m.Archive.Folder); err != nil {
+			return err
+		}
+	}
+	if m.Sent.Enabled {
+		if err := dst.EnsureNamedFolder(m.Sent.Folder); err != nil {
 			return err
 		}
 	}
@@ -128,6 +142,9 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 		ArchiveRouting: m.Archive.Enabled,
 		SourceInbox:    m.Source.Inbox,
 		ArchiveFolder:  m.Archive.Folder,
+		SentRouting:    m.Sent.Enabled,
+		SentSrcFolder:  sentSrcFolder,
+		SentFolder:     m.Sent.Folder,
 		LabelPropagate: m.Labels.Propagate,
 		OnProgress:     onProgress,
 	}, log)
@@ -217,7 +234,7 @@ func runReconcile(ctx context.Context, rec *reconcile.Reconciler, log *slog.Logg
 	log.Info("reconcile done",
 		"candidates", sum.Candidates, "copied", sum.Copied, "skipped_dupes", sum.SkippedDup,
 		"moved_to_archive", sum.MovedToArchive, "moved_to_inbox", sum.MovedToInbox,
-		"keywords_updated", sum.KeywordsUpdated,
+		"moved_to_sent", sum.MovedToSent, "keywords_updated", sum.KeywordsUpdated,
 		"uidvalidity_changed", sum.UIDValidityChanged,
 		"took", time.Since(start).Round(time.Millisecond))
 	return nil

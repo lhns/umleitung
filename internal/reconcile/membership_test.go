@@ -334,6 +334,130 @@ func TestWatchedFolderUIDValidityReset(t *testing.T) {
 	}
 }
 
+// sentSetup: m1 in inbox, m2 sent-only, m3 neither (archived), m4 in inbox
+// AND sent (mail to self).
+func sentSetup() (*fakeStore, *fakeSource, *fakeDest) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs: []fakeMsg{
+			msg(1, "<m1@x>", "raw-1"),
+			msg(2, "<m2@x>", "raw-2"),
+			msg(3, "<m3@x>", "raw-3"),
+			msg(4, "<m4@x>", "raw-4"),
+		},
+		labelFolders: map[string]*fakeLabelFolder{
+			"INBOX":   {uidValidity: 70, msgs: []fakeMsg{msg(1, "<m1@x>", "raw-1"), msg(4, "<m4@x>", "raw-4")}},
+			"SENTSRC": {uidValidity: 71, msgs: []fakeMsg{msg(2, "<m2@x>", "raw-2"), msg(4, "<m4@x>", "raw-4")}},
+		},
+	}
+	return store, src, newFakeDest()
+}
+
+func sentOpts() Options {
+	return Options{ArchiveRouting: true, SentRouting: true}
+}
+
+func TestSentRoutingAtCopyTimeWithPriority(t *testing.T) {
+	store, src, dst := sentSetup()
+	rec := newRec(store, src, dst, sentOpts())
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 4 {
+		t.Fatalf("copied %d, want 4", sum.Copied)
+	}
+	// m1 inbox -> DEST; m2 sent-only -> SENT; m3 -> ARCHIVE;
+	// m4 inbox+sent -> DEST (inbox wins).
+	for mid, folder := range map[string]string{
+		"<m1@x>": fakeDestFolder, "<m2@x>": fakeSentFolder,
+		"<m3@x>": fakeArchiveFolder, "<m4@x>": fakeDestFolder,
+	} {
+		if has, _ := dst.HasMessageIDIn(folder, mid); !has {
+			t.Errorf("%s not in %s", mid, folder)
+		}
+	}
+	if dst.total() != 4 {
+		t.Fatalf("total = %d, want 4", dst.total())
+	}
+}
+
+func TestSentPropagationOnArchiveOfSelfMail(t *testing.T) {
+	store, src, dst := sentSetup()
+	rec := newRec(store, src, dst, sentOpts())
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// User archives the mail-to-self m4: it leaves INBOX but stays in Sent
+	// -> desired bucket becomes the Sent folder.
+	src.labelFolders["INBOX"].msgs = src.labelFolders["INBOX"].msgs[:1] // keep only m1
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToSent != 1 {
+		t.Fatalf("moved_to_sent = %d, want 1 (%+v)", sum.MovedToSent, sum)
+	}
+	if has, _ := dst.HasMessageIDIn(fakeSentFolder, "<m4@x>"); !has {
+		t.Fatal("m4 not moved to sent folder")
+	}
+	if dst.total() != 4 {
+		t.Fatalf("total = %d, want 4", dst.total())
+	}
+}
+
+// Backfill: sent mail that landed in Archive under archive-only routing moves
+// to the Sent folder when sent routing is enabled later.
+func TestBackfillMovesSentOutOfArchive(t *testing.T) {
+	store, src, dst := sentSetup()
+
+	// Phase 1: archive routing only — sent-only m2 lands in ARCHIVE.
+	rec := newRec(store, src, dst, Options{ArchiveRouting: true, SourceInbox: "INBOX"})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if has, _ := dst.HasMessageIDIn(fakeArchiveFolder, "<m2@x>"); !has {
+		t.Fatal("setup: m2 not in archive")
+	}
+
+	// Phase 2: sent routing enabled — backfill sorts m2 (and m4 stays DEST).
+	rec = newRec(store, src, dst, sentOpts())
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToSent != 1 {
+		t.Fatalf("backfill moved_to_sent = %d, want 1 (%+v)", sum.MovedToSent, sum)
+	}
+	if has, _ := dst.HasMessageIDIn(fakeSentFolder, "<m2@x>"); !has {
+		t.Fatal("m2 not in sent folder after backfill")
+	}
+	if dst.total() != 4 {
+		t.Fatalf("total = %d, want 4 (no dupes)", dst.total())
+	}
+}
+
+// Sent-source membership must never leak into label keywords.
+func TestSentFolderIsNotALabel(t *testing.T) {
+	store, src, dst := sentSetup()
+	opts := sentOpts()
+	opts.SyncLabels = true
+	opts.SourceFolder = fakeMainFolder
+	rec := newRec(store, src, dst, opts)
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range dst.inFolder(fakeSentFolder) {
+		for _, f := range m.flags {
+			if f == "sentsrc" || f == "inbox" {
+				t.Fatalf("routing folder leaked as keyword: %v", m.flags)
+			}
+		}
+	}
+}
+
 // Upgrade auto-correction: mail mirrored WITHOUT routing gets sorted into the
 // right folders when routing is enabled (placement backfill).
 func TestBackfillAfterEnablingRouting(t *testing.T) {

@@ -86,6 +86,9 @@ on-by-default feature off, set it explicitly: `health_addr: null`.
 | `source.inbox` | `INBOX` | The "in inbox" folder for archive routing |
 | `archive.enabled` | `false` | See Archive routing below |
 | `archive.folder` | `Archive` | Destination folder for archived mail; created if missing |
+| `sent.enabled` | `false` | Route sent mail to its own destination folder (see Archive routing) |
+| `sent.folder` | `Sent` | Destination folder for sent mail; created if missing |
+| `sent.source_folder` | `\Sent` | Source sent folder (selector or exact localized name) |
 | `labels.enabled` | `false` | See Label sync below |
 | `labels.propagate` | `false` | Post-copy label changes as keyword deltas (requires `labels.enabled`) |
 | `labels.exclude` | `[]` | Folder names excluded from the label scan |
@@ -170,6 +173,15 @@ source folder but **not** in `source.inbox` is archived.
 - Caveats: mail *deleted* in the source also leaves its inbox, so its copy
   moves to Archive (Umleiter never deletes). Messages without a `Message-ID`
   are routed at copy time but not moved afterwards (unlocatable; rare).
+
+**Sent routing** (`sent.enabled: true`) is the same mechanism for sent mail:
+membership in the source's `\Sent` folder (resolved like any special-use
+selector; localization-proof) routes the copy to `sent.folder` so mail
+clients show it as sent instead of it landing in Archive. Routing priority
+when memberships overlap (e.g. mail to yourself is in inbox *and* sent):
+**inbox > sent > archive**. Propagation and the placement backfill cover
+sent mail exactly like archive mail — enabling it later sorts your
+already-mirrored sent messages out of Archive automatically.
 
 ## State database upgrades
 

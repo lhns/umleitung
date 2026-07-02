@@ -36,6 +36,10 @@ mirrors:
     archive:                 # route by source-inbox membership + propagate moves
       enabled: true
       # folder: Archive
+    sent:                    # route by source-Sent membership + propagate moves
+      enabled: true
+      # folder: Sent
+      # source_folder: '\Sent'   # selector or exact (localized) name
     labels:                  # label-folder membership -> destination keywords
       enabled: true
       propagate: true        # apply post-copy label changes as keyword deltas

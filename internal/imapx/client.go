@@ -168,27 +168,36 @@ func (cl *Client) ListFolders() ([]FolderInfo, error) {
 	return folders, nil
 }
 
-// ResolveSpecialUse resolves a special-use folder selector in the endpoint's
-// configured folder (e.g. `\All`, `\Sent` — RFC 6154) to the server's actual
-// folder name, which providers localize (German Gmail exposes All Mail as
-// "[Gmail]/Alle Nachrichten"). Plain folder names pass through unchanged.
-// The resolved name becomes the client's working folder.
-func (cl *Client) ResolveSpecialUse() (string, error) {
-	if !strings.HasPrefix(cl.ep.Folder, `\`) {
-		return cl.ep.Folder, nil
+// ResolveFolder resolves a special-use folder selector (e.g. `\All`, `\Sent`
+// — RFC 6154) to the server's actual folder name, which providers localize
+// (German Gmail exposes All Mail as "[Google Mail]/Alle Nachrichten"). Plain
+// folder names pass through unchanged.
+func (cl *Client) ResolveFolder(nameOrSelector string) (string, error) {
+	if !strings.HasPrefix(nameOrSelector, `\`) {
+		return nameOrSelector, nil
 	}
-	attr := imap.MailboxAttr(cl.ep.Folder)
+	attr := imap.MailboxAttr(nameOrSelector)
 	folders, err := cl.ListFolders()
 	if err != nil {
 		return "", err
 	}
 	for _, f := range folders {
 		if slices.Contains(f.Attrs, attr) {
-			cl.ep.Folder = f.Name
 			return f.Name, nil
 		}
 	}
 	return "", fmt.Errorf("no folder with special-use attribute %q on %s (server caps missing SPECIAL-USE, or attribute not present)", attr, cl.ep.Addr())
+}
+
+// ResolveSpecialUse resolves the endpoint's configured folder (see
+// ResolveFolder) and makes the result the client's working folder.
+func (cl *Client) ResolveSpecialUse() (string, error) {
+	name, err := cl.ResolveFolder(cl.ep.Folder)
+	if err != nil {
+		return "", err
+	}
+	cl.ep.Folder = name
+	return name, nil
 }
 
 // EnsureFolder creates the endpoint's default folder if it does not exist yet.
@@ -497,14 +506,17 @@ func (cl *Client) MoveMessageID(fromFolder, toFolder, messageID string) (bool, e
 	return true, nil
 }
 
-// MoveUIDs batch-moves messages by UID from the currently selected folder.
-// Used by the placement backfill; chunking is the caller's concern.
-func (cl *Client) MoveUIDs(uids []imap.UID, toFolder string) error {
+// MoveUIDs batch-moves messages by UID from one folder to another. Used by
+// the placement backfill; chunking is the caller's concern.
+func (cl *Client) MoveUIDs(fromFolder string, uids []imap.UID, toFolder string) error {
 	if len(uids) == 0 {
 		return nil
 	}
+	if err := cl.ensureSelected(fromFolder); err != nil {
+		return err
+	}
 	if _, err := cl.c.Move(imap.UIDSetNum(uids...), toFolder).Wait(); err != nil {
-		return fmt.Errorf("move %d uids to %q on %s: %w", len(uids), toFolder, cl.ep.Addr(), err)
+		return fmt.Errorf("move %d uids %q -> %q on %s: %w", len(uids), fromFolder, toFolder, cl.ep.Addr(), err)
 	}
 	cl.selected = "" // message set changed; be conservative
 	return nil
