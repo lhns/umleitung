@@ -183,6 +183,27 @@ for Docker Swarm (secrets, bind mount, `replicas: 1`) see [`stack.yml`](stack.ym
 file lock refuses a second instance on the same state volume, and the Swarm
 stack pins `replicas: 1` — keep it that way.
 
+## How a sync pass works
+
+Every reconcile runs these phases in order (visible as `progress phase=…`
+log lines during long runs; `processed` is the UID watermark or running
+count, and progress lines are throttled to ≥30s apart):
+
+| # | Phase (log name) | Reads | Writes | Resumability |
+|---|---|---|---|---|
+| 0 | `seed` (startup only, per `SEED_DEST`) | destination folders | local state only | per window |
+| 1 | `membership` / `membership-rebuild` | source label folders + `SOURCE_INBOX` | local state only | incremental scans: per window; first-time/UIDVALIDITY rebuild: per folder (an interrupted folder rescans from its start) |
+| 2 | `mirror` | source folder | **appends to the destination** (routed, with keywords) | per window (`last_uid` commits every `UID_BATCH` messages) |
+| 3 | `backfill` (only when placement config changed) | destination folders | moves + keyword additions on the destination | idempotent; reruns until completed once |
+| 4 | propagation | pending-op queue | moves + keyword deltas on the destination | queued ops survive failures and retry next pass |
+
+Nothing is written to the destination before phase 2. Cancelling at any
+point (SIGTERM, crash, provider disconnect) is safe: every phase either
+commits progress in windows or is idempotent, and dedup guarantees no
+duplicates regardless of where a run stopped. The membership rebuild in
+phase 1 is first-run-only work — later reconciles diff incrementally and
+pass through in seconds.
+
 ## First run
 
 - **Back up the state volume** once the initial mirror completes (`/state`);
