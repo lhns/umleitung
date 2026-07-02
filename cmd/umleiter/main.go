@@ -1,26 +1,25 @@
 // Umleiter — one-way IMAP → IMAP mail mirror.
 //
-// Single process, single sync loop. Near-real-time via IMAP IDLE with a
-// periodic full reconcile as a safety net. Idempotent by Message-ID:
-// re-running any number of times never duplicates.
+// One instance runs any number of configured mirrors concurrently, each with
+// its own connections, state database and supervision loop. Idempotent by
+// Message-ID: re-running any number of times never duplicates.
 package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/lhns/umleitung/internal/config"
-	"github.com/lhns/umleitung/internal/imapx"
 	"github.com/lhns/umleitung/internal/lock"
-	"github.com/lhns/umleitung/internal/reconcile"
-	"github.com/lhns/umleitung/internal/state"
+	"github.com/lhns/umleitung/internal/mirror"
 )
 
 func main() {
@@ -30,23 +29,17 @@ func main() {
 		os.Exit(healthcheck())
 	}
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadFile(config.Path())
 	if err != nil {
 		slog.Error("invalid configuration", "err", err)
 		os.Exit(2)
 	}
 
 	log := newLogger(cfg.LogLevel)
-	log.Info("umleiter starting",
-		"source", cfg.Source.Addr(), "source_folder", cfg.Source.Folder,
-		"dest", cfg.Dest.Addr(), "dest_folder", cfg.Dest.Folder,
-		"poll_interval", cfg.PollInterval, "seed_dest", string(cfg.SeedDest),
-		"dest_guard", cfg.DestGuard, "uid_batch", cfg.UIDBatch,
-		"sync_labels", cfg.SyncLabels, "archive_routing", cfg.ArchiveRouting,
-		"label_propagate", cfg.LabelPropagate)
+	log.Info("umleiter starting", "config", config.Path(), "mirrors", len(cfg.Mirrors))
 
 	// Cross-process guard: refuse to start if another instance holds the
-	// state volume. Two syncers would double-append.
+	// state volume. Two instances would double-append.
 	l, err := lock.Acquire(cfg.LockPath)
 	if err != nil {
 		log.Error("startup lock failed", "err", err)
@@ -54,242 +47,62 @@ func main() {
 	}
 	defer l.Release()
 
-	store, err := state.Open(cfg.StatePath)
-	if err != nil {
-		log.Error("state open failed", "err", err)
-		os.Exit(1)
-	}
-	defer store.Close()
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Liveness heartbeat: bumped at boot and on every unit of progress
-	// (connect attempts, scan/mirror windows, IDLE wakes, backoff retries).
-	// /healthz turns unhealthy only when the heartbeat goes stale — a huge
-	// first run or a provider-throttled backoff is healthy; a wedged process
-	// is not.
-	var heartbeat atomic.Int64
-	heartbeat.Store(time.Now().Unix())
+	// Per-mirror liveness heartbeats; /healthz aggregates them.
+	type mirrorHealth struct {
+		name      string
+		staleness time.Duration
+		beat      *atomic.Int64
+	}
+	health := make([]mirrorHealth, len(cfg.Mirrors))
+	for i, m := range cfg.Mirrors {
+		health[i] = mirrorHealth{name: m.Name, staleness: 3 * m.PollInterval, beat: &atomic.Int64{}}
+		health[i].beat.Store(time.Now().Unix())
+	}
 	if cfg.HealthAddr != "" {
-		go serveHealth(cfg, log, &heartbeat)
-	}
-
-	// Outer supervision loop: (re)connect both sides with exponential
-	// backoff, run the sync loop, and on any connection error start over.
-	// Provider throttle/quota disconnects (e.g. Gmail's daily IMAP download
-	// cap) land here too — they are expected during a large first run and
-	// simply back off and resume.
-	backoff := time.Second
-	const maxBackoff = 5 * time.Minute
-	for {
-		if ctx.Err() != nil {
-			log.Info("shutting down")
-			return
-		}
-		heartbeat.Store(time.Now().Unix())
-		err := runSession(ctx, cfg, store, log, &heartbeat)
-		if err == nil || errors.Is(err, context.Canceled) {
-			log.Info("shutting down")
-			return
-		}
-		heartbeat.Store(time.Now().Unix())
-		log.Error("session ended, will reconnect", "err", err, "backoff", backoff)
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
-	}
-}
-
-// runSession connects both endpoints and runs reconcile+IDLE until an error
-// or shutdown. Returning nil means clean shutdown.
-func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log *slog.Logger, heartbeat *atomic.Int64) error {
-	src, err := imapx.Dial(cfg.Source)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	// Resolve special-use selectors (e.g. SOURCE_FOLDER=\All) to the actual,
-	// possibly localized folder name (German Gmail: [Gmail]/Alle Nachrichten).
-	srcFolder, err := src.ResolveSpecialUse()
-	if err != nil {
-		return err
-	}
-	if srcFolder != cfg.Source.Folder {
-		log.Info("resolved special-use source folder", "selector", cfg.Source.Folder, "folder", srcFolder)
-	}
-
-	dst, err := imapx.Dial(cfg.Dest)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-
-	if err := dst.EnsureFolder(); err != nil {
-		return err
-	}
-	if cfg.ArchiveRouting {
-		if err := dst.EnsureNamedFolder(cfg.ArchiveFolder); err != nil {
-			return err
-		}
-	}
-	// Select the destination folder: the per-append destination guard and
-	// seeding search/fetch against it (re-selected on demand thereafter).
-	if _, _, _, err := dst.SelectFolder(); err != nil {
-		return err
-	}
-
-	// Heartbeat + throttled progress logging for long-running phases.
-	var lastProgressLog atomic.Int64
-	onProgress := func(phase, item string, processed int) {
-		heartbeat.Store(time.Now().Unix())
-		now := time.Now().Unix()
-		if last := lastProgressLog.Load(); now-last >= 30 && lastProgressLog.CompareAndSwap(last, now) {
-			if item != "" {
-				log.Info("progress", "phase", phase, "folder", item, "processed", processed)
-			} else {
-				log.Info("progress", "phase", phase, "processed", processed)
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+				for _, h := range health {
+					if time.Since(time.Unix(h.beat.Load(), 0)) > h.staleness {
+						http.Error(w, fmt.Sprintf("mirror %q made no progress recently", h.name), http.StatusServiceUnavailable)
+						return
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("ok"))
+			})
+			if err := http.ListenAndServe(cfg.HealthAddr, mux); err != nil {
+				log.Error("health server failed", "err", err)
 			}
-		}
+		}()
 	}
 
-	rec := reconcile.New(store, src, dst, reconcile.Options{
-		UIDBatch:       cfg.UIDBatch,
-		DestGuard:      cfg.DestGuard,
-		CarrySeen:      cfg.CarrySeen,
-		SyncLabels:     cfg.SyncLabels,
-		SourceFolder:   srcFolder,
-		LabelExclude:   cfg.LabelExclude,
-		DestFolder:     cfg.Dest.Folder,
-		ArchiveRouting: cfg.ArchiveRouting,
-		SourceInbox:    cfg.SourceInbox,
-		ArchiveFolder:  cfg.ArchiveFolder,
-		LabelPropagate: cfg.LabelPropagate,
-		OnProgress:     onProgress,
-	}, log)
-
-	// Destination seeding: bootstrap the dedup set from what the destination
-	// already holds, so correctness never depends on local state.
-	if err := maybeSeed(ctx, cfg, store, rec, log); err != nil {
-		return err
+	var wg sync.WaitGroup
+	for i, m := range cfg.Mirrors {
+		wg.Add(1)
+		go func(m config.Mirror, beat *atomic.Int64) {
+			defer wg.Done()
+			if err := mirror.Run(ctx, m, log, beat); err != nil {
+				log.Error("mirror failed", "mirror", m.Name, "err", err)
+				stop() // a mirror that cannot run at all (e.g. state db) takes the instance down for a clean restart
+			}
+		}(m, health[i].beat)
 	}
-
-	// Initial catch-up (may be large on first run; windowed + resumable).
-	if err := runReconcile(ctx, rec, log, heartbeat); err != nil {
-		return err
-	}
-
-	// IDLE/poll loop. go-imap auto-restarts IDLE every ~28min; IDLE_RESET is
-	// our own extra cap on one IDLE session, POLL_INTERVAL the reconcile
-	// safety net. Any wake → stop IDLE → reconcile → re-IDLE.
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-		idle, err := src.Idle()
-		if err != nil {
-			return err
-		}
-		wake := time.NewTimer(minDuration(cfg.PollInterval, cfg.IdleReset))
-		var reason string
-		select {
-		case <-src.Notify():
-			reason = "idle-push"
-		case <-wake.C:
-			reason = "timer"
-		case <-ctx.Done():
-			reason = "shutdown"
-		}
-		wake.Stop()
-		heartbeat.Store(time.Now().Unix())
-		if err := idle.Close(); err != nil {
-			return err
-		}
-		if err := idle.Wait(); err != nil {
-			return err
-		}
-		if reason == "shutdown" {
-			return nil
-		}
-		log.Debug("reconcile triggered", "reason", reason)
-		if err := runReconcile(ctx, rec, log, heartbeat); err != nil {
-			return err
-		}
-	}
-}
-
-func maybeSeed(ctx context.Context, cfg *config.Config, store *state.Store, rec *reconcile.Reconciler, log *slog.Logger) error {
-	seed := false
-	switch cfg.SeedDest {
-	case config.SeedAlways:
-		seed = true
-	case config.SeedEmpty:
-		n, err := store.CopiedCount()
-		if err != nil {
-			return err
-		}
-		seed = n == 0
-	}
-	if !seed {
-		return nil
-	}
-	log.Info("seeding dedup set from destination folder", "folder", cfg.Dest.Folder)
-	start := time.Now()
-	n, err := rec.SeedFromDest(ctx)
-	if err != nil {
-		return err
-	}
-	log.Info("seeding done", "keys", n, "took", time.Since(start).Round(time.Millisecond))
-	return nil
-}
-
-func runReconcile(ctx context.Context, rec *reconcile.Reconciler, log *slog.Logger, heartbeat *atomic.Int64) error {
-	start := time.Now()
-	sum, err := rec.Run(ctx)
-	if err != nil {
-		return err
-	}
-	heartbeat.Store(time.Now().Unix())
-	log.Info("reconcile done",
-		"candidates", sum.Candidates, "copied", sum.Copied, "skipped_dupes", sum.SkippedDup,
-		"moved_to_archive", sum.MovedToArchive, "moved_to_inbox", sum.MovedToInbox,
-		"keywords_updated", sum.KeywordsUpdated,
-		"uidvalidity_changed", sum.UIDValidityChanged,
-		"took", time.Since(start).Round(time.Millisecond))
-	return nil
-}
-
-// serveHealth exposes /healthz: 200 while the process shows signs of life
-// (progress windows, connect attempts, IDLE wakes), 503 when the heartbeat
-// goes stale for 3× POLL_INTERVAL (wedged container → Swarm restarts). Long
-// first runs and provider-throttle backoffs keep the heartbeat fresh.
-func serveHealth(cfg *config.Config, log *slog.Logger, heartbeat *atomic.Int64) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		last := heartbeat.Load()
-		if last == 0 || time.Since(time.Unix(last, 0)) > 3*cfg.PollInterval {
-			http.Error(w, "no progress recently", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	if err := http.ListenAndServe(cfg.HealthAddr, mux); err != nil {
-		log.Error("health server failed", "err", err)
-	}
+	wg.Wait()
+	log.Info("umleiter stopped")
 }
 
 // healthcheck probes the local /healthz endpoint of the running instance.
 func healthcheck() int {
-	addr := os.Getenv("HEALTH_ADDR")
-	if addr == "" {
-		addr = ":8080"
+	addr := ":8080"
+	if cfg, err := config.LoadFile(config.Path()); err == nil {
+		if cfg.HealthAddr == "" {
+			return 0 // health disabled by config: nothing to probe
+		}
+		addr = cfg.HealthAddr
 	}
 	if addr[0] == ':' {
 		addr = "127.0.0.1" + addr
@@ -331,11 +144,4 @@ func newLogger(level string) *slog.Logger {
 	}))
 	slog.SetDefault(log)
 	return log
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

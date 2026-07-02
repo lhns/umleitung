@@ -1,0 +1,46 @@
+# Umleiter configuration. Mount at /config/umleiter.yaml (or set CONFIG_PATH).
+#
+# Every optional field has a default that applies when the key is OMITTED —
+# omission never disables anything. To disable an on-by-default feature, set
+# it explicitly to null, e.g. `health_addr: null`.
+
+# health_addr: ":8080"       # /healthz liveness endpoint; `null` disables
+# log_level: info            # debug|info|warn|error
+# state_dir: /state          # per-mirror db defaults to {state_dir}/{name}.db
+# lock_path: /state/umleiter.lock
+
+mirrors:
+  - name: pierre             # required; [a-z0-9_-]+; used for db filename + logs
+    # state_path: /state/umleiter.db  # override to keep a pre-existing db
+    # poll_interval: 15m     # safety-net reconcile cadence
+    # idle_reset: 25m        # max length of one IDLE session
+    # uid_batch: 2000        # window size of the resumable scan
+    # seed: empty            # empty|always|never — seed dedup set from destination
+    # dest_guard: true       # per-window batched Message-ID check on the destination
+    # carry_seen: true       # propagate \Seen from source
+    source:
+      host: imap.gmail.com
+      user: user@gmail.com
+      password_file: /run/secrets/gmail_password   # or `password: ...`
+      folder: '\All'         # special-use selector; resolves localized names
+                             # (e.g. [Google Mail]/Alle Nachrichten). Plain
+                             # names are used verbatim. Default: INBOX
+      # inbox: INBOX         # the "in inbox" folder for archive routing
+      # port: 993
+      # tls: true
+    dest:
+      host: mail.example.org
+      user: user@example.org
+      password_file: /run/secrets/dest_password
+      folder: INBOX
+    archive:                 # route by source-inbox membership + propagate moves
+      enabled: true
+      # folder: Archive
+    labels:                  # label-folder membership -> destination keywords
+      enabled: true
+      propagate: true        # apply post-copy label changes as keyword deltas
+      # exclude: [Notes]
+
+  # - name: otheruser        # any number of mirrors run concurrently
+  #   source: { host: imap.gmail.com, user: other@gmail.com, password_file: /run/secrets/other_src, folder: '\All' }
+  #   dest:   { host: mail.example.org, user: other@example.org, password_file: /run/secrets/other_dst, folder: INBOX }

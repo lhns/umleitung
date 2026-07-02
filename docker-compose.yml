@@ -1,30 +1,14 @@
-# Simple docker-compose deployment (single container, env-file config).
+# Simple docker-compose deployment (single container, YAML config).
 # For Docker Swarm with secrets, see stack.yml instead.
 services:
   umleiter:
     image: ghcr.io/lhns/umleitung:latest
     build: .
     restart: unless-stopped
-    environment:
-      # Example: mirroring Gmail's All Mail into a self-hosted server.
-      SOURCE_HOST: "imap.gmail.com"
-      SOURCE_USER: "${SOURCE_USER}"
-      SOURCE_PASSWORD: "${SOURCE_PASSWORD}"
-      SOURCE_FOLDER: '\All'           # special-use selector; resolves localized Gmail folder names (single-quote: backslash)
-      DEST_HOST: "${DEST_HOST}"
-      DEST_USER: "${DEST_USER}"
-      DEST_PASSWORD: "${DEST_PASSWORD}"
-      DEST_FOLDER: "Mirror"
-      # All other settings have sensible defaults; override as needed:
-      # SYNC_LABELS: "true"          # mirror label-folder membership as keywords
-      # LABEL_PROPAGATE: "true"      # apply post-copy label changes as keyword deltas
-      # LABEL_EXCLUDE: "Notes"       # folders to skip in the label scan
-      # ARCHIVE_ROUTING: "true"      # inbox mail -> DEST_FOLDER, archived -> DEST_ARCHIVE_FOLDER
-      # DEST_ARCHIVE_FOLDER: "Archive"
-      # POLL_INTERVAL: "900"
-      # LOG_LEVEL: "info"
     volumes:
-      # The state volume is the dedup fast path — persistent, backed up.
+      # Configuration (see config.example.yaml for the full schema).
+      - ./umleiter.yaml:/config/umleiter.yaml:ro
+      # State: dedup fast path — persistent, backed up.
       # Owner must be uid 65532 (distroless nonroot): chown -R 65532 ./state
       - ./state:/state
     healthcheck:

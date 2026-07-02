@@ -1,13 +1,19 @@
-// Package config loads all Umleiter configuration from environment variables.
-// Secrets support *_FILE variants (Docker/Swarm secrets mounted as files).
+// Package config loads Umleiter's YAML configuration.
+//
+// Defaults philosophy: an omitted field always gets its documented default —
+// omission never disables anything. Disabling an on-by-default feature takes
+// an explicit null (or ""), e.g. `health_addr: null`.
 package config
 
 import (
 	"fmt"
 	"os"
-	"strconv"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // SeedMode controls when the copied-key set is seeded from the destination folder.
@@ -19,184 +25,316 @@ const (
 	SeedNever  SeedMode = "never"  // never seed
 )
 
-// Endpoint describes one IMAPS endpoint (host, credentials, folder).
+// DefaultConfigPath is used when CONFIG_PATH is not set.
+const DefaultConfigPath = "/config/umleiter.yaml"
+
+// Config is the resolved instance configuration.
+type Config struct {
+	HealthAddr string // "" = disabled (explicit null/"" in yaml)
+	LogLevel   string
+	StateDir   string
+	LockPath   string
+	Mirrors    []Mirror
+}
+
+// Mirror is one source→destination mail mirror.
+type Mirror struct {
+	Name         string
+	StatePath    string
+	PollInterval time.Duration
+	IdleReset    time.Duration
+	UIDBatch     int
+	Seed         SeedMode
+	DestGuard    bool
+	CarrySeen    bool
+	Source       Endpoint
+	Dest         Endpoint
+	Archive      Archive
+	Labels       Labels
+}
+
+// Endpoint describes one IMAPS endpoint.
 type Endpoint struct {
 	Host     string
 	Port     int
 	User     string
 	Password string
 	Folder   string
-	TLS      bool // implicit TLS (IMAPS); disable only for local testing
+	Inbox    string // source only: the "in inbox" folder for archive routing
+	TLS      bool
 }
 
 // Addr returns host:port.
 func (e Endpoint) Addr() string { return fmt.Sprintf("%s:%d", e.Host, e.Port) }
 
-// Config is the full runtime configuration.
-type Config struct {
-	Source Endpoint
-	Dest   Endpoint
-
-	PollInterval time.Duration // safety-net full reconcile interval
-	IdleReset    time.Duration // re-IDLE before the server force-drops idle connections (Gmail: ~29min)
-
-	StatePath string
-	LockPath  string
-
-	SeedDest  SeedMode
-	DestGuard bool
-	UIDBatch  int
-	CarrySeen bool
-
-	SyncLabels   bool     // mirror source label-folder membership as dest keywords
-	LabelExclude []string // folder names excluded from the label scan
-
-	ArchiveRouting bool   // route by source-INBOX membership; propagate archive moves
-	SourceInbox    string // source folder whose membership means "in inbox"
-	ArchiveFolder  string // destination folder for archived mail
-	LabelPropagate bool   // STORE keyword changes for post-copy label changes (needs SyncLabels)
-
-	HealthAddr string // empty = disabled
-	LogLevel   string
+// Archive groups the archive-routing settings.
+type Archive struct {
+	Enabled bool
+	Folder  string
 }
 
-// Load reads configuration from the environment, applying defaults and
-// validating required values.
-func Load() (*Config, error) {
+// Labels groups the label-sync settings.
+type Labels struct {
+	Enabled   bool
+	Propagate bool
+	Exclude   []string
+}
+
+// ---- raw yaml schema (pointers/wrappers to distinguish absent from set) ----
+
+// optString reads a raw yaml.Node to distinguish "key absent" (default
+// applies) from "explicitly null or empty" (disabled). A bare yaml.Node
+// field is the only construct yaml.v3 populates even for null values
+// (custom unmarshalers are skipped for null).
+func optString(n yaml.Node) (value string, set bool, err error) {
+	if n.Kind == 0 {
+		return "", false, nil // key absent
+	}
+	if n.Tag == "!!null" {
+		return "", true, nil // explicit null -> disabled
+	}
+	err = n.Decode(&value)
+	return value, true, err
+}
+
+// duration parses Go duration strings ("15m", "1h30m").
+type duration time.Duration
+
+func (d *duration) UnmarshalYAML(n *yaml.Node) error {
+	var s string
+	if err := n.Decode(&s); err != nil {
+		return err
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	*d = duration(v)
+	return nil
+}
+
+type rawConfig struct {
+	HealthAddr yaml.Node   `yaml:"health_addr"`
+	LogLevel   string      `yaml:"log_level"`
+	StateDir   string      `yaml:"state_dir"`
+	LockPath   string      `yaml:"lock_path"`
+	Mirrors    []rawMirror `yaml:"mirrors"`
+}
+
+type rawMirror struct {
+	Name         string      `yaml:"name"`
+	StatePath    string      `yaml:"state_path"`
+	PollInterval duration    `yaml:"poll_interval"`
+	IdleReset    duration    `yaml:"idle_reset"`
+	UIDBatch     int         `yaml:"uid_batch"`
+	Seed         string      `yaml:"seed"`
+	DestGuard    *bool       `yaml:"dest_guard"`
+	CarrySeen    *bool       `yaml:"carry_seen"`
+	Source       rawEndpoint `yaml:"source"`
+	Dest         rawEndpoint `yaml:"dest"`
+	Archive      rawArchive  `yaml:"archive"`
+	Labels       rawLabels   `yaml:"labels"`
+}
+
+type rawEndpoint struct {
+	Host         string `yaml:"host"`
+	Port         int    `yaml:"port"`
+	User         string `yaml:"user"`
+	Password     string `yaml:"password"`
+	PasswordFile string `yaml:"password_file"`
+	Folder       string `yaml:"folder"`
+	Inbox        string `yaml:"inbox"`
+	TLS          *bool  `yaml:"tls"`
+}
+
+type rawArchive struct {
+	Enabled bool   `yaml:"enabled"`
+	Folder  string `yaml:"folder"`
+}
+
+type rawLabels struct {
+	Enabled   bool     `yaml:"enabled"`
+	Propagate bool     `yaml:"propagate"`
+	Exclude   []string `yaml:"exclude"`
+}
+
+// ---- loading ----
+
+// Path returns the config file path (CONFIG_PATH env or the default).
+func Path() string {
+	if p := os.Getenv("CONFIG_PATH"); p != "" {
+		return p
+	}
+	return DefaultConfigPath
+}
+
+var nameRe = regexp.MustCompile(`^[a-z0-9_-]+$`)
+
+// LoadFile reads, defaults and validates the YAML configuration. Unknown
+// keys are rejected (typo protection).
+func LoadFile(path string) (*Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w (set CONFIG_PATH or mount %s)", err, DefaultConfigPath)
+	}
+	defer f.Close()
+
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true)
+	var raw rawConfig
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("config %s: %w", path, err)
+	}
+	return resolve(&raw)
+}
+
+func resolve(raw *rawConfig) (*Config, error) {
 	var errs []string
-
-	str := func(name, def string) string {
-		if v, ok := os.LookupEnv(name); ok {
-			return v
-		}
-		return def
-	}
-
-	secret := func(name string) string {
-		if v, ok := os.LookupEnv(name); ok && v != "" {
-			return v
-		}
-		if path, ok := os.LookupEnv(name + "_FILE"); ok && path != "" {
-			b, err := os.ReadFile(path)
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("%s_FILE: %v", name, err))
-				return ""
-			}
-			return strings.TrimSpace(string(b))
-		}
-		return ""
-	}
-
-	num := func(name string, def int) int {
-		v, ok := os.LookupEnv(name)
-		if !ok || v == "" {
-			return def
-		}
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("%s: not a number: %q", name, v))
-			return def
-		}
-		return n
-	}
-
-	csv := func(name string) []string {
-		v := os.Getenv(name)
-		if v == "" {
-			return nil
-		}
-		var out []string
-		for part := range strings.SplitSeq(v, ",") {
-			if p := strings.TrimSpace(part); p != "" {
-				out = append(out, p)
-			}
-		}
-		return out
-	}
-
-	boolean := func(name string, def bool) bool {
-		v, ok := os.LookupEnv(name)
-		if !ok || v == "" {
-			return def
-		}
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("%s: not a bool: %q", name, v))
-			return def
-		}
-		return b
-	}
+	fail := func(format string, a ...any) { errs = append(errs, fmt.Sprintf(format, a...)) }
 
 	cfg := &Config{
-		Source: Endpoint{
-			Host:     str("SOURCE_HOST", ""),
-			Port:     num("SOURCE_PORT", 993),
-			User:     str("SOURCE_USER", ""),
-			Password: secret("SOURCE_PASSWORD"),
-			Folder:   str("SOURCE_FOLDER", "INBOX"),
-			TLS:      boolean("SOURCE_TLS", true),
-		},
-		Dest: Endpoint{
-			Host:     str("DEST_HOST", ""),
-			Port:     num("DEST_PORT", 993),
-			User:     str("DEST_USER", ""),
-			Password: secret("DEST_PASSWORD"),
-			Folder:   str("DEST_FOLDER", "INBOX"),
-			TLS:      boolean("DEST_TLS", true),
-		},
-		PollInterval: time.Duration(num("POLL_INTERVAL", 900)) * time.Second,
-		IdleReset:    time.Duration(num("IDLE_RESET", 1500)) * time.Second,
-		StatePath:    str("STATE_PATH", "/state/umleiter.db"),
-		LockPath:     str("LOCK_PATH", "/state/umleiter.lock"),
-		SeedDest:     SeedMode(strings.ToLower(str("SEED_DEST", string(SeedEmpty)))),
-		DestGuard:    boolean("DEST_GUARD", true),
-		UIDBatch:     num("UID_BATCH", 2000),
-		CarrySeen:    boolean("CARRY_SEEN", true),
-		SyncLabels:   boolean("SYNC_LABELS", false),
-		LabelExclude: csv("LABEL_EXCLUDE"),
-		ArchiveRouting: boolean("ARCHIVE_ROUTING", false),
-		SourceInbox:    str("SOURCE_INBOX", "INBOX"),
-		ArchiveFolder:  str("DEST_ARCHIVE_FOLDER", "Archive"),
-		LabelPropagate: boolean("LABEL_PROPAGATE", false),
-		HealthAddr:   str("HEALTH_ADDR", ":8080"),
-		LogLevel:     strings.ToLower(str("LOG_LEVEL", "info")),
+		HealthAddr: ":8080",
+		LogLevel:   strings.ToLower(defaultStr(raw.LogLevel, "info")),
+		StateDir:   defaultStr(raw.StateDir, "/state"),
 	}
+	if v, set, err := optString(raw.HealthAddr); err != nil {
+		fail("health_addr: %v", err)
+	} else if set {
+		cfg.HealthAddr = v // explicit null/"" disables
+	}
+	cfg.LockPath = defaultStr(raw.LockPath, filepath.Join(cfg.StateDir, "umleiter.lock"))
 
-	if cfg.Source.Host == "" {
-		errs = append(errs, "SOURCE_HOST is required")
+	if len(raw.Mirrors) == 0 {
+		fail("at least one mirror is required")
 	}
-	if cfg.Source.User == "" {
-		errs = append(errs, "SOURCE_USER is required")
-	}
-	if cfg.Source.Password == "" {
-		errs = append(errs, "SOURCE_PASSWORD (or SOURCE_PASSWORD_FILE) is required")
-	}
-	if cfg.Dest.Host == "" {
-		errs = append(errs, "DEST_HOST is required")
-	}
-	if cfg.Dest.User == "" {
-		errs = append(errs, "DEST_USER is required")
-	}
-	if cfg.Dest.Password == "" {
-		errs = append(errs, "DEST_PASSWORD (or DEST_PASSWORD_FILE) is required")
-	}
-	switch cfg.SeedDest {
-	case SeedEmpty, SeedAlways, SeedNever:
-	default:
-		errs = append(errs, fmt.Sprintf("SEED_DEST: must be empty|always|never, got %q", cfg.SeedDest))
-	}
-	if cfg.UIDBatch < 1 {
-		errs = append(errs, "UID_BATCH must be >= 1")
-	}
-	if cfg.LabelPropagate && !cfg.SyncLabels {
-		errs = append(errs, "LABEL_PROPAGATE requires SYNC_LABELS=true")
-	}
-	if cfg.ArchiveRouting && cfg.ArchiveFolder == cfg.Dest.Folder {
-		errs = append(errs, "DEST_ARCHIVE_FOLDER must differ from DEST_FOLDER when ARCHIVE_ROUTING is enabled")
+	names := map[string]bool{}
+	statePaths := map[string]string{}
+	for i := range raw.Mirrors {
+		rm := &raw.Mirrors[i]
+		m := Mirror{
+			Name:         rm.Name,
+			PollInterval: defaultDur(rm.PollInterval, 15*time.Minute),
+			IdleReset:    defaultDur(rm.IdleReset, 25*time.Minute),
+			UIDBatch:     defaultInt(rm.UIDBatch, 2000),
+			Seed:         SeedMode(strings.ToLower(defaultStr(rm.Seed, string(SeedEmpty)))),
+			DestGuard:    defaultBool(rm.DestGuard, true),
+			CarrySeen:    defaultBool(rm.CarrySeen, true),
+			Archive: Archive{
+				Enabled: rm.Archive.Enabled,
+				Folder:  defaultStr(rm.Archive.Folder, "Archive"),
+			},
+			Labels: Labels{
+				Enabled:   rm.Labels.Enabled,
+				Propagate: rm.Labels.Propagate,
+				Exclude:   rm.Labels.Exclude,
+			},
+		}
+
+		where := fmt.Sprintf("mirror %q", rm.Name)
+		if rm.Name == "" {
+			where = fmt.Sprintf("mirror #%d", i+1)
+			fail("%s: name is required", where)
+		} else if !nameRe.MatchString(rm.Name) {
+			fail("%s: name must match %s", where, nameRe)
+		} else if names[rm.Name] {
+			fail("%s: duplicate name", where)
+		}
+		names[rm.Name] = true
+
+		m.StatePath = defaultStr(rm.StatePath, filepath.Join(cfg.StateDir, rm.Name+".db"))
+		if other, dup := statePaths[m.StatePath]; dup {
+			fail("%s: state_path %q already used by mirror %q", where, m.StatePath, other)
+		}
+		statePaths[m.StatePath] = rm.Name
+
+		var err error
+		if m.Source, err = resolveEndpoint(&rm.Source, "INBOX"); err != nil {
+			fail("%s source: %v", where, err)
+		}
+		if m.Dest, err = resolveEndpoint(&rm.Dest, "INBOX"); err != nil {
+			fail("%s dest: %v", where, err)
+		}
+
+		switch m.Seed {
+		case SeedEmpty, SeedAlways, SeedNever:
+		default:
+			fail("%s: seed must be empty|always|never, got %q", where, m.Seed)
+		}
+		if m.Labels.Propagate && !m.Labels.Enabled {
+			fail("%s: labels.propagate requires labels.enabled", where)
+		}
+		if m.Archive.Enabled && m.Archive.Folder == m.Dest.Folder {
+			fail("%s: archive.folder must differ from dest.folder", where)
+		}
+		if m.UIDBatch < 1 {
+			fail("%s: uid_batch must be >= 1", where)
+		}
+
+		cfg.Mirrors = append(cfg.Mirrors, m)
 	}
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: %s", strings.Join(errs, "; "))
 	}
 	return cfg, nil
+}
+
+func resolveEndpoint(raw *rawEndpoint, defaultFolder string) (Endpoint, error) {
+	ep := Endpoint{
+		Host:   raw.Host,
+		Port:   defaultInt(raw.Port, 993),
+		User:   raw.User,
+		Folder: defaultStr(raw.Folder, defaultFolder),
+		Inbox:  defaultStr(raw.Inbox, "INBOX"),
+		TLS:    defaultBool(raw.TLS, true),
+	}
+	if ep.Host == "" {
+		return ep, fmt.Errorf("host is required")
+	}
+	if ep.User == "" {
+		return ep, fmt.Errorf("user is required")
+	}
+	switch {
+	case raw.Password != "" && raw.PasswordFile != "":
+		return ep, fmt.Errorf("set either password or password_file, not both")
+	case raw.Password != "":
+		ep.Password = raw.Password
+	case raw.PasswordFile != "":
+		b, err := os.ReadFile(raw.PasswordFile)
+		if err != nil {
+			return ep, fmt.Errorf("password_file: %w", err)
+		}
+		ep.Password = strings.TrimSpace(string(b))
+	default:
+		return ep, fmt.Errorf("password (or password_file) is required")
+	}
+	return ep, nil
+}
+
+func defaultStr(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func defaultInt(v, def int) int {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
+func defaultDur(v duration, def time.Duration) time.Duration {
+	if v == 0 {
+		return def
+	}
+	return time.Duration(v)
+}
+
+func defaultBool(v *bool, def bool) bool {
+	if v == nil {
+		return def
+	}
+	return *v
 }

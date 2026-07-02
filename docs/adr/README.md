@@ -17,3 +17,4 @@ settled. Format: [Michael Nygard's ADR template](https://cognitect.com/blog/2011
 | [0009](0009-product-agnostic-source-dest-naming.md) | Product-agnostic naming: SOURCE/DEST, not Gmail/Stalwart |
 | [0010](0010-label-sync-via-folder-membership.md) | Label sync via folder membership → IMAP keywords; categories out of scope |
 | [0011](0011-membership-propagation-archive-and-labels.md) | Membership propagation: archive routing/moves + label keyword updates; DB migrations |
+| [0012](0012-yaml-config-multi-mirror.md) | YAML configuration and multi-mirror instances |

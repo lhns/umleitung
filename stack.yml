@@ -1,31 +1,20 @@
 # Docker Swarm stack for Umleiter.
 #
-#   docker stack deploy -c stack.yml umleiter
-#
-# Requires external secrets:
+#   docker config create umleiter_config umleiter.yaml
 #   printf '%s' 'the-source-password' | docker secret create umleiter_source_password -
 #   printf '%s' 'the-dest-password'   | docker secret create umleiter_dest_password -
+#   docker stack deploy -c stack.yml umleiter
+#
+# The yaml references the secrets via password_file: /run/secrets/...
 services:
   umleiter:
     image: ghcr.io/lhns/umleitung:latest
-    environment:
-      # Example: mirroring a Gmail account into a self-hosted Stalwart server.
-      SOURCE_HOST: "imap.gmail.com"
-      SOURCE_USER: "user@gmail.com"
-      SOURCE_PASSWORD_FILE: /run/secrets/umleiter_source_password
-      SOURCE_FOLDER: '\All'           # special-use selector; resolves localized Gmail folder names (single-quote: backslash)
-      DEST_HOST: "mail.example.org"
-      DEST_USER: "user@example.org"
-      DEST_PASSWORD_FILE: /run/secrets/umleiter_dest_password
-      DEST_FOLDER: "Mirror"
-      # SYNC_LABELS: "true"          # mirror label-folder membership as keywords
-      # LABEL_PROPAGATE: "true"      # apply post-copy label changes as keyword deltas
-      # ARCHIVE_ROUTING: "true"      # inbox mail -> DEST_FOLDER, archived -> DEST_ARCHIVE_FOLDER
-      # DEST_ARCHIVE_FOLDER: "Archive"
-      # POLL_INTERVAL: "900"
+    configs:
+      - source: umleiter_config
+        target: /config/umleiter.yaml
     volumes:
-      # State volume = dedup fast path. Persistent bind mount; back it up
-      # before the first big run. Owner must be uid 65532 (distroless nonroot).
+      # State = dedup fast path. Persistent bind mount; back it up after the
+      # first big run. Owner must be uid 65532 (distroless nonroot).
       - /srv/mail/umleiter/state:/state
     secrets:
       - umleiter_source_password
@@ -43,6 +32,10 @@ services:
       restart_policy:
         condition: any
         delay: 10s
+
+configs:
+  umleiter_config:
+    external: true
 
 secrets:
   umleiter_source_password:

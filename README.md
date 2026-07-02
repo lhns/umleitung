@@ -3,7 +3,8 @@
 One-way **IMAP → IMAP** mail mirror. A single small container that
 continuously copies mail from a folder on one IMAP server (source) into a
 folder on another (destination) — near-real-time via IMAP IDLE, with a
-periodic full reconcile as a safety net.
+periodic full reconcile as a safety net. One instance runs **any number of
+mirrors** (e.g. several users' mailboxes) concurrently.
 
 Works with any IMAP servers. Its original use case: mirroring a Gmail
 account's All Mail into a self-hosted mailbox.
@@ -26,54 +27,91 @@ account's All Mail into a self-hosted mailbox.
   3. **Destination guard** (default on): before appending a message not in
      the set, the destination is searched for its `Message-ID` directly. This
      closes the "appended but crashed before recording" window.
-- **No concurrent syncs.** The sync loop is single-goroutine, and a
-  cross-process file lock on the state volume makes a second instance refuse
-  to start. Run exactly one replica regardless.
+- **No concurrent syncs.** Each mirror's sync loop is single-goroutine
+  (mirrors are isolated from each other), and a cross-process file lock on
+  the state volume makes a second instance refuse to start. Run exactly one
+  replica regardless.
 
 ## Configuration
 
-Everything is configured via environment variables. Secrets accept `*_FILE`
-variants pointing at a file (Docker/Swarm secrets).
+One YAML file, mounted at `/config/umleiter.yaml` (override with the
+`CONFIG_PATH` env var — the only environment variable that exists). Full
+annotated schema: [`config.example.yaml`](config.example.yaml). Unknown keys
+are rejected (typo protection).
 
-| Variable | Default | Description |
+```yaml
+mirrors:
+  - name: pierre                       # [a-z0-9_-]+; db filename + log field
+    source:
+      host: imap.gmail.com
+      user: user@gmail.com
+      password_file: /run/secrets/gmail_password   # or `password:`
+      folder: '\All'                   # special-use selector or exact name
+    dest:
+      host: mail.example.org
+      user: user@example.org
+      password_file: /run/secrets/dest_password
+      folder: INBOX
+    archive: { enabled: true }         # archived mail -> Archive folder + moves
+    labels:  { enabled: true, propagate: true }   # labels -> keywords + deltas
+  - name: otheruser                    # any number of mirrors, run concurrently
+    source: { host: imap.gmail.com, user: other@gmail.com, password_file: /run/secrets/o1, folder: '\All' }
+    dest:   { host: mail.example.org, user: other@example.org, password_file: /run/secrets/o2, folder: INBOX }
+```
+
+**Defaults: omission never disables anything.** Every optional key has a
+sensible default that applies when the key is absent (`health_addr` →
+`":8080"`, `tls` → `true`, `poll_interval` → `15m`, …). To turn an
+on-by-default feature off, set it explicitly: `health_addr: null`.
+
+| Key | Default | Description |
 |---|---|---|
-| `SOURCE_HOST` | — (required) | Source IMAP host |
-| `SOURCE_PORT` | `993` | Source port |
-| `SOURCE_USER` | — (required) | Source account |
-| `SOURCE_PASSWORD` / `_FILE` | — (required) | Source password (use an app password where available) |
-| `SOURCE_FOLDER` | `INBOX` | Source folder; accepts a special-use selector like `\All` or `\Sent` (RFC 6154), resolved to the server's actual — possibly localized — folder name at connect time |
-| `SOURCE_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
-| `DEST_HOST` | — (required) | Destination IMAP host |
-| `DEST_PORT` | `993` | Destination port |
-| `DEST_USER` | — (required) | Destination account |
-| `DEST_PASSWORD` / `_FILE` | — (required) | Destination password (use an app password where available) |
-| `DEST_FOLDER` | `INBOX` | Destination folder; created if missing |
-| `DEST_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
-| `POLL_INTERVAL` | `900` | Seconds between safety-net reconciles |
-| `IDLE_RESET` | `1500` | Max seconds for one IDLE session (servers force-drop idle connections; go-imap also auto-restarts IDLE every ~28 min) |
-| `STATE_PATH` | `/state/umleiter.db` | SQLite state database |
-| `LOCK_PATH` | `/state/umleiter.lock` | Cross-process startup lock |
-| `SEED_DEST` | `empty` | Seed dedup set from destination: `empty` (only when local set is empty), `always`, `never` |
-| `DEST_GUARD` | `true` | Per-append `SEARCH HEADER Message-ID` on destination |
-| `UID_BATCH` | `2000` | UID window size for the windowed, resumable scan |
-| `CARRY_SEEN` | `true` | Propagate `\Seen` from source (no other flags/keywords are ever copied) |
-| `SYNC_LABELS` | `false` | Mirror source label-folder membership as destination keywords (see below) |
-| `LABEL_EXCLUDE` | — | Comma-separated folder names to exclude from the label scan |
-| `LABEL_PROPAGATE` | `false` | Apply post-copy label changes to already-mirrored mail (±keyword deltas; requires `SYNC_LABELS`) |
-| `ARCHIVE_ROUTING` | `false` | Route by source-INBOX membership and propagate archive moves (see below) |
-| `SOURCE_INBOX` | `INBOX` | Source folder whose membership means "in inbox" |
-| `DEST_ARCHIVE_FOLDER` | `Archive` | Destination folder for archived mail; created if missing |
-| `HEALTH_ADDR` | `:8080` | `/healthz` liveness endpoint; empty disables |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `health_addr` | `":8080"` | `/healthz` liveness endpoint; `null` disables |
+| `log_level` | `info` | `debug`, `info`, `warn`, `error` |
+| `state_dir` | `/state` | Per-mirror db defaults to `{state_dir}/{name}.db` |
+| `lock_path` | `{state_dir}/umleiter.lock` | Single-instance lock |
+| `mirrors[].name` | — required | Unique, `[a-z0-9_-]+` |
+| `mirrors[].state_path` | `{state_dir}/{name}.db` | Override to keep a pre-existing db |
+| `mirrors[].poll_interval` | `15m` | Safety-net reconcile cadence |
+| `mirrors[].idle_reset` | `25m` | Max length of one IDLE session |
+| `mirrors[].uid_batch` | `2000` | Window size of the resumable scan |
+| `mirrors[].seed` | `empty` | Seed dedup set from destination: `empty`/`always`/`never` |
+| `mirrors[].dest_guard` | `true` | Batched per-window Message-ID check on the destination |
+| `mirrors[].carry_seen` | `true` | Propagate `\Seen` (no other flags are ever copied) |
+| `source`/`dest`.`host`,`user` | — required | |
+| `source`/`dest`.`password` / `password_file` | — required (one of) | `password_file` for Docker/Swarm secrets |
+| `source`/`dest`.`port` | `993` | |
+| `source`/`dest`.`tls` | `true` | Implicit TLS (IMAPS); `false` only for local testing |
+| `source`/`dest`.`folder` | `INBOX` | Source accepts special-use selectors (`\All`, `\Sent`); dest folder is created if missing |
+| `source.inbox` | `INBOX` | The "in inbox" folder for archive routing |
+| `archive.enabled` | `false` | See Archive routing below |
+| `archive.folder` | `Archive` | Destination folder for archived mail; created if missing |
+| `labels.enabled` | `false` | See Label sync below |
+| `labels.propagate` | `false` | Post-copy label changes as keyword deltas (requires `labels.enabled`) |
+| `labels.exclude` | `[]` | Folder names excluded from the label scan |
 
 Tip: pick a dedicated destination folder (e.g. `Mirror`) rather than `INBOX`
-or `Archive` — mirrored mail stays clearly separated from natively-delivered
-mail and folder semantics stay clean.
+or `Archive` when you don't use archive routing — mirrored mail stays clearly
+separated from natively-delivered mail.
 
-## Label sync (`SYNC_LABELS=true`, optional)
+### Migrating from the env-var configuration (pre-YAML versions)
+
+| Old env var | YAML path |
+|---|---|
+| `SOURCE_HOST/PORT/USER/PASSWORD(_FILE)/FOLDER/TLS` | `source.host/port/user/password(_file)/folder/tls` |
+| `DEST_*` (same fields) | `dest.*` |
+| `SOURCE_INBOX` | `source.inbox` |
+| `ARCHIVE_ROUTING` / `DEST_ARCHIVE_FOLDER` | `archive.enabled` / `archive.folder` |
+| `SYNC_LABELS` / `LABEL_PROPAGATE` / `LABEL_EXCLUDE` | `labels.enabled` / `labels.propagate` / `labels.exclude` |
+| `POLL_INTERVAL` (seconds) / `IDLE_RESET` | `poll_interval: 15m` / `idle_reset: 25m` (durations) |
+| `SEED_DEST` / `DEST_GUARD` / `UID_BATCH` / `CARRY_SEEN` | `seed` / `dest_guard` / `uid_batch` / `carry_seen` |
+| `STATE_PATH` | `mirrors[].state_path` — **set this to your old path** (`/state/umleiter.db`) **to keep existing state**; otherwise the mirror starts a fresh db (safe — seeding prevents duplicates — but re-scans) |
+| `LOCK_PATH` / `HEALTH_ADDR` / `LOG_LEVEL` | `lock_path` / `health_addr` / `log_level` (top level) |
+
+## Label sync (`labels.enabled: true`, optional)
 
 Label-based servers (notably Gmail) expose each user label as an IMAP
-folder — a message with N labels appears in N folders. With `SYNC_LABELS=true`
+folder — a message with N labels appears in N folders. With `labels.enabled: true`
 Umleiter scans those folders (incrementally, same resumable machinery as the
 mirror itself) and appends each message with its labels attached as **IMAP
 keywords** on the destination.
@@ -89,7 +127,7 @@ keywords** on the destination.
   are mapped like `[Werbung]` → `werbung`, `Work/Projects` → `work_projects`,
   `Bücher` → `b_cher` (lowercased — IMAP flags are case-insensitive).
   Distinct labels can collide after sanitization; harmless.
-- **Post-copy changes propagate with `LABEL_PROPAGATE=true`:** labels
+- **Post-copy changes propagate with `labels.propagate: true`:** labels
   added/removed in the source after a message was mirrored are applied to the
   destination copy as **deltas** (`STORE ±FLAGS` of just the changed keyword,
   diffed against the previously recorded state) — never a full rewrite, so
@@ -105,19 +143,19 @@ keywords** on the destination.
   are searchable (`SEARCH KEYWORD` / JMAP `hasKeyword`).
 - Excluded automatically: the source folder, `INBOX`, and special-use folders
   (Sent, Trash, Junk, All Mail, Starred, Important, Drafts, Archive). Add
-  more via `LABEL_EXCLUDE=Notes,Some/Other`.
+  more via `labels.exclude: [Notes, Some/Other]`.
 
-## Archive routing (`ARCHIVE_ROUTING=true`, optional)
+## Archive routing (`archive.enabled: true`, optional)
 
 There is no "archived" flag in IMAP — archiving in Gmail just removes the
 Inbox label. Umleiter derives it from folder membership: a message in the
-source folder but **not** in `SOURCE_INBOX` is archived.
+source folder but **not** in `source.inbox` is archived.
 
-- **Routing:** inbox members are mirrored into `DEST_FOLDER`; everything else
-  (archived and sent-only mail) goes to `DEST_ARCHIVE_FOLDER`. The initial
+- **Routing:** inbox members are mirrored into `dest.folder`; everything else
+  (archived and sent-only mail) goes to `archive.folder`. The initial
   bulk run sorts years of mail correctly from the start.
 - **Propagation:** archiving a message in the source later MOVEs its
-  destination copy `DEST_FOLDER` → `DEST_ARCHIVE_FOLDER` on the next
+  destination copy `dest.folder` → `archive.folder` on the next
   reconcile (seconds via IDLE) — and moving it back to the source inbox moves
   it back. Moves never delete content.
 - **Upgrade auto-correction:** enabling the feature (or changing folders) on
@@ -126,8 +164,8 @@ source folder but **not** in `SOURCE_INBOX` is archived.
   keywords. Idempotent and crash-safe.
 - **Manual refiling respected:** if you moved a destination copy elsewhere,
   propagation skips it silently — the mirror never chases your moves.
-- Typical Gmail setup: `SOURCE_FOLDER=[Gmail]/All Mail`, `DEST_FOLDER=INBOX`,
-  `ARCHIVE_ROUTING=true` → your Stalwart INBOX mirrors your Gmail inbox, and
+- Typical Gmail setup: `source.folder: 'All'`, `dest.folder: INBOX`,
+  `archive.enabled: true` → your Stalwart INBOX mirrors your Gmail inbox, and
   your Stalwart Archive holds everything you archived.
 - Caveats: mail *deleted* in the source also leaves its inbox, so its copy
   moves to Archive (Umleiter never deletes). Messages without a `Message-ID`
@@ -142,24 +180,15 @@ by a *newer* version is refused with a clear error.
 
 ## Deployment
 
-Single container. Example `docker-compose.yml` (mirroring a Gmail account
-into a self-hosted server):
+Single container: mount the config and a persistent state volume.
 
 ```yaml
 services:
   umleiter:
     image: ghcr.io/lhns/umleitung:latest
     restart: unless-stopped
-    environment:
-      SOURCE_HOST: "imap.gmail.com"
-      SOURCE_USER: "user@gmail.com"
-      SOURCE_PASSWORD: "the-gmail-app-password"
-      SOURCE_FOLDER: "[Gmail]/All Mail"
-      DEST_HOST: "mail.example.org"
-      DEST_USER: "user@example.org"
-      DEST_PASSWORD: "the-dest-app-password"
-      DEST_FOLDER: "Mirror"
     volumes:
+      - ./umleiter.yaml:/config/umleiter.yaml:ro
       # Persistent state (dedup fast path). Owner must be uid 65532
       # (distroless nonroot): chown -R 65532 ./state
       - ./state:/state
@@ -171,13 +200,14 @@ services:
 ```
 
 ```sh
+cp config.example.yaml umleiter.yaml   # edit hosts/users/secrets
 mkdir -p state && chown -R 65532 state
 docker compose up -d
 ```
 
-Prefer `SOURCE_PASSWORD_FILE`/`DEST_PASSWORD_FILE` over inline passwords where
-possible. A ready-to-edit copy lives at [`docker-compose.yml`](docker-compose.yml);
-for Docker Swarm (secrets, bind mount, `replicas: 1`) see [`stack.yml`](stack.yml).
+Prefer `password_file` over inline passwords. Ready-to-edit copies live at
+[`docker-compose.yml`](docker-compose.yml) and, for Docker Swarm (config +
+secrets + `replicas: 1`), [`stack.yml`](stack.yml).
 
 **Never run more than one instance.** Two syncers would race to append. The
 file lock refuses a second instance on the same state volume, and the Swarm
@@ -192,7 +222,7 @@ count, and progress lines are throttled to ≥30s apart):
 | # | Phase (log name) | Reads | Writes | Resumability |
 |---|---|---|---|---|
 | 0 | `seed` (startup only, per `SEED_DEST`) | destination folders | local state only | per window |
-| 1 | `membership` / `membership-rebuild` | source label folders + `SOURCE_INBOX` | local state only | incremental scans: per window; first-time/UIDVALIDITY rebuild: per folder (an interrupted folder rescans from its start) |
+| 1 | `membership` / `membership-rebuild` | source label folders + `source.inbox` | local state only | incremental scans: per window; first-time/UIDVALIDITY rebuild: per folder (an interrupted folder rescans from its start) |
 | 2 | `mirror` | source folder | **appends to the destination** (routed, with keywords) | per window (`last_uid` commits every `UID_BATCH` messages) |
 | 3 | `backfill` (only when placement config changed) | destination folders | moves + keyword additions on the destination | idempotent; reruns until completed once |
 | 4 | propagation | pending-op queue | moves + keyword deltas on the destination | queued ops survive failures and retry next pass |
@@ -215,25 +245,25 @@ pass through in seconds.
   window. Progress is never lost and interrupting/restarting at any point is
   safe.
 - If the destination was **pre-populated by a prior bulk import** (e.g.
-  imapsync into the same folder), the default `SEED_DEST=empty` handles it:
+  imapsync into the same folder), the default `seed: empty` handles it:
   existing messages are seeded into the dedup set on first start and never
   re-copied.
 
 ## Provider notes
 
 - **Gmail as source:** to mirror everything (inbox, sent, archived), set
-  `SOURCE_FOLDER` to your account's All-Mail folder. **Gmail localizes its
+  `source.folder` to your account's All-Mail folder. **Gmail localizes its
   special folder names over IMAP per account language**: `[Gmail]/All Mail`
   on English accounts, `[Gmail]/Alle Nachrichten` on German ones, etc. Either
   set the exact localized name, or set the explicit special-use selector
-  `SOURCE_FOLDER=\All` (RFC 6154), which resolves to that folder by its
+  `folder: '\All'` (RFC 6154), which resolves to that folder by its
   `\All` attribute regardless of language. `INBOX` is never localized (the
   name is reserved by the IMAP protocol; "Posteingang" is only the UI label),
-  so `SOURCE_INBOX=INBOX` always works. Requires an app password (account
+  so `source.inbox: INBOX` always works. Requires an app password (account
   with 2FA). Gmail caps IMAP download at roughly ~2.5 GB/day — the first full
   mirror of years of mail may take days; this is a quota, not a bug. Gmail
   also force-drops IDLE connections after ~29 minutes; handled automatically.
-  Gmail **labels** appear as IMAP folders → `SYNC_LABELS=true` mirrors them
+  Gmail **labels** appear as IMAP folders → `labels.enabled: true` mirrors them
   as keywords. Gmail **categories** (Primary/Allgemein, Promotions/Werbung,
   Social, Updates, Forums) are *not* labels and *not* folders — they are not
   exposed over standard IMAP at all (only via Gmail-proprietary extensions or
