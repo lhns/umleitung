@@ -147,11 +147,15 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 
 	// Heartbeat + throttled progress logging for long-running phases.
 	var lastProgressLog atomic.Int64
-	onProgress := func(phase string, processed int) {
+	onProgress := func(phase, item string, processed int) {
 		heartbeat.Store(time.Now().Unix())
 		now := time.Now().Unix()
 		if last := lastProgressLog.Load(); now-last >= 30 && lastProgressLog.CompareAndSwap(last, now) {
-			log.Info("progress", "phase", phase, "processed", processed)
+			if item != "" {
+				log.Info("progress", "phase", phase, "folder", item, "processed", processed)
+			} else {
+				log.Info("progress", "phase", phase, "processed", processed)
+			}
 		}
 	}
 

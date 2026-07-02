@@ -90,12 +90,14 @@ type Options struct {
 	// OnProgress, if set, is called after every committed work window in any
 	// long-running phase (seeding, membership scan, mirror, backfill). Used
 	// as a liveness heartbeat and for progress reporting during large runs.
-	OnProgress func(phase string, processed int)
+	// item names the current work unit (e.g. "Work 3/12" for folder 3 of 12);
+	// empty when the phase has a single implicit unit.
+	OnProgress func(phase, item string, processed int)
 }
 
-func (o *Options) progress(phase string, processed int) {
+func (o *Options) progress(phase, item string, processed int) {
 	if o.OnProgress != nil {
-		o.OnProgress(phase, processed)
+		o.OnProgress(phase, item, processed)
 	}
 }
 
@@ -211,7 +213,7 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 		if err := r.store.SetLastUID(stop); err != nil {
 			return sum, err
 		}
-		r.opts.progress("mirror", sum.Copied)
+		r.opts.progress("mirror", "", sum.Copied)
 	}
 
 	// Placement/keyword backfill: auto-corrects mail mirrored before the
@@ -331,8 +333,8 @@ func (r *Reconciler) SeedFromDest(ctx context.Context) (int64, error) {
 		folders = append(folders, r.opts.ArchiveFolder)
 	}
 	var seeded int64
-	for _, folder := range folders {
-		n, err := r.seedFromDestFolder(ctx, folder)
+	for i, folder := range folders {
+		n, err := r.seedFromDestFolder(ctx, folder, fmt.Sprintf("%s %d/%d", folder, i+1, len(folders)))
 		seeded += n
 		if err != nil {
 			return seeded, fmt.Errorf("seed %q: %w", folder, err)
@@ -341,7 +343,7 @@ func (r *Reconciler) SeedFromDest(ctx context.Context) (int64, error) {
 	return seeded, nil
 }
 
-func (r *Reconciler) seedFromDestFolder(ctx context.Context, folder string) (int64, error) {
+func (r *Reconciler) seedFromDestFolder(ctx context.Context, folder, item string) (int64, error) {
 	_, uidNext, numMessages, err := r.dst.SelectNamedFolder(folder)
 	if err != nil {
 		return 0, err
@@ -367,7 +369,7 @@ func (r *Reconciler) seedFromDestFolder(ctx context.Context, folder string) (int
 			return seeded, err
 		}
 		seeded += int64(len(keys))
-		r.opts.progress("seed", int(seeded))
+		r.opts.progress("seed", item, int(seeded))
 	}
 	return seeded, nil
 }

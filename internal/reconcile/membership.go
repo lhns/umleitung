@@ -19,28 +19,32 @@ const (
 // source INBOX) and records membership changes. Runs before the mirror phase
 // so routing and copy-time keywords see current state.
 func (r *Reconciler) syncMembership(ctx context.Context) error {
+	type watched struct{ name, kind string }
+	var list []watched
 	if r.opts.SyncLabels {
 		folders, err := r.src.ListFolders()
 		if err != nil {
 			return err
 		}
 		exclude := r.opts.labelExcludeSet()
+		kind := ""
+		if r.opts.LabelPropagate {
+			kind = pendingKeyword
+		}
 		for _, f := range folders {
 			if f.Name == r.opts.SourceInbox || !isLabelFolder(f, r.opts.SourceFolder, exclude) {
 				continue
 			}
-			kind := ""
-			if r.opts.LabelPropagate {
-				kind = pendingKeyword
-			}
-			if err := r.syncWatchedFolder(ctx, f.Name, kind); err != nil {
-				return fmt.Errorf("label folder %q: %w", f.Name, err)
-			}
+			list = append(list, watched{f.Name, kind})
 		}
 	}
 	if r.opts.ArchiveRouting {
-		if err := r.syncWatchedFolder(ctx, r.opts.SourceInbox, pendingMove); err != nil {
-			return fmt.Errorf("inbox folder %q: %w", r.opts.SourceInbox, err)
+		list = append(list, watched{r.opts.SourceInbox, pendingMove})
+	}
+	for i, w := range list {
+		item := fmt.Sprintf("%s %d/%d", w.name, i+1, len(list))
+		if err := r.syncWatchedFolder(ctx, w.name, w.kind, item); err != nil {
+			return fmt.Errorf("folder %q: %w", w.name, err)
 		}
 	}
 	return nil
@@ -49,7 +53,7 @@ func (r *Reconciler) syncMembership(ctx context.Context) error {
 // syncWatchedFolder diffs one source folder's membership against the stored
 // members and records changes. pendingKind ("" = none) selects the pending
 // destination operation enqueued for already-copied messages.
-func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind string) error {
+func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind, item string) error {
 	uidValidity, uidNext, _, err := r.src.SelectNamedFolder(folder)
 	if err != nil {
 		return err
@@ -60,7 +64,7 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind 
 	}
 
 	if storedValidity != uidValidity {
-		return r.rebuildWatchedFolder(ctx, folder, pendingKind, uidValidity, uidNext)
+		return r.rebuildWatchedFolder(ctx, folder, pendingKind, item, uidValidity, uidNext)
 	}
 
 	// Removal detection: uid-set diff against the full current snapshot.
@@ -106,7 +110,7 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind 
 		if err := r.store.SetFolderState(folder, uidValidity, stop); err != nil {
 			return err
 		}
-		r.opts.progress("membership", int(stop))
+		r.opts.progress("membership", item, int(stop))
 	}
 	if uidNext <= 1 || lastUID >= uidNext-1 {
 		// Nothing scanned; still keep state current.
@@ -119,7 +123,7 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind 
 // full windowed scan, diffed against stored membership BY KEY (stored uids
 // are meaningless). Pending ops are suppressed when the stored set was empty
 // (feature activation — the placement backfill covers existing mail).
-func (r *Reconciler) rebuildWatchedFolder(ctx context.Context, folder, pendingKind string, uidValidity, uidNext uint32) error {
+func (r *Reconciler) rebuildWatchedFolder(ctx context.Context, folder, pendingKind, item string, uidValidity, uidNext uint32) error {
 	storedKeys, err := r.store.MemberKeys(folder)
 	if err != nil {
 		return err
@@ -148,7 +152,7 @@ func (r *Reconciler) rebuildWatchedFolder(ctx context.Context, folder, pendingKi
 				return err
 			}
 		}
-		r.opts.progress("membership-rebuild", int(stop))
+		r.opts.progress("membership-rebuild", item, int(stop))
 	}
 	// Stored members no longer present anywhere in the folder -> removals.
 	for key := range storedKeys {
@@ -370,7 +374,7 @@ func (r *Reconciler) backfillDestFolder(ctx context.Context, folder string, sum 
 		if err != nil {
 			return fmt.Errorf("window %d:%d: %w", start, stop, err)
 		}
-		r.opts.progress("backfill", int(stop))
+		r.opts.progress("backfill", folder, int(stop))
 		for i := range metas {
 			key := DedupKey(&metas[i])
 

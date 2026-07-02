@@ -637,7 +637,7 @@ func TestOnProgressCalledPerWindow(t *testing.T) {
 	var calls int
 	rec := newRec(store, src, dst, Options{
 		UIDBatch:   2, // 6 messages -> 3 mirror windows
-		OnProgress: func(phase string, processed int) { calls++ },
+		OnProgress: func(phase, item string, processed int) { calls++ },
 	})
 	if _, err := rec.Run(context.Background()); err != nil {
 		t.Fatal(err)
