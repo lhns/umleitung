@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	srcFolder = "[Gmail]/All Mail"
-	dstFolder = "Gmail"
+	srcFolder = "Remote/All Mail" // hierarchical, exercises delimiter handling
+	dstFolder = "Mirror"
 	password  = "hunter2"
 )
 

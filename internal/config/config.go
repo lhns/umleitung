@@ -34,11 +34,11 @@ func (e Endpoint) Addr() string { return fmt.Sprintf("%s:%d", e.Host, e.Port) }
 
 // Config is the full runtime configuration.
 type Config struct {
-	Gmail    Endpoint
-	Stalwart Endpoint
+	Source Endpoint
+	Dest   Endpoint
 
 	PollInterval time.Duration // safety-net full reconcile interval
-	IdleReset    time.Duration // re-IDLE before Gmail's ~29min forced logout
+	IdleReset    time.Duration // re-IDLE before the server force-drops idle connections (Gmail: ~29min)
 
 	StatePath string
 	LockPath  string
@@ -106,21 +106,21 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Gmail: Endpoint{
-			Host:     str("GMAIL_HOST", "imap.gmail.com"),
-			Port:     num("GMAIL_PORT", 993),
-			User:     str("GMAIL_USER", ""),
-			Password: secret("GMAIL_APP_PASSWORD"),
-			Folder:   str("GMAIL_FOLDER", "[Gmail]/All Mail"),
-			TLS:      boolean("GMAIL_TLS", true),
+		Source: Endpoint{
+			Host:     str("SOURCE_HOST", ""),
+			Port:     num("SOURCE_PORT", 993),
+			User:     str("SOURCE_USER", ""),
+			Password: secret("SOURCE_PASSWORD"),
+			Folder:   str("SOURCE_FOLDER", "INBOX"),
+			TLS:      boolean("SOURCE_TLS", true),
 		},
-		Stalwart: Endpoint{
-			Host:     str("STALWART_HOST", "mail.lhns.de"),
-			Port:     num("STALWART_PORT", 993),
-			User:     str("STALWART_USER", ""),
-			Password: secret("STALWART_APP_PASSWORD"),
-			Folder:   str("STALWART_FOLDER", "Gmail"),
-			TLS:      boolean("STALWART_TLS", true),
+		Dest: Endpoint{
+			Host:     str("DEST_HOST", ""),
+			Port:     num("DEST_PORT", 993),
+			User:     str("DEST_USER", ""),
+			Password: secret("DEST_PASSWORD"),
+			Folder:   str("DEST_FOLDER", "INBOX"),
+			TLS:      boolean("DEST_TLS", true),
 		},
 		PollInterval: time.Duration(num("POLL_INTERVAL", 900)) * time.Second,
 		IdleReset:    time.Duration(num("IDLE_RESET", 1500)) * time.Second,
@@ -134,17 +134,23 @@ func Load() (*Config, error) {
 		LogLevel:     strings.ToLower(str("LOG_LEVEL", "info")),
 	}
 
-	if cfg.Gmail.User == "" {
-		errs = append(errs, "GMAIL_USER is required")
+	if cfg.Source.Host == "" {
+		errs = append(errs, "SOURCE_HOST is required")
 	}
-	if cfg.Gmail.Password == "" {
-		errs = append(errs, "GMAIL_APP_PASSWORD (or GMAIL_APP_PASSWORD_FILE) is required")
+	if cfg.Source.User == "" {
+		errs = append(errs, "SOURCE_USER is required")
 	}
-	if cfg.Stalwart.User == "" {
-		errs = append(errs, "STALWART_USER is required")
+	if cfg.Source.Password == "" {
+		errs = append(errs, "SOURCE_PASSWORD (or SOURCE_PASSWORD_FILE) is required")
 	}
-	if cfg.Stalwart.Password == "" {
-		errs = append(errs, "STALWART_APP_PASSWORD (or STALWART_APP_PASSWORD_FILE) is required")
+	if cfg.Dest.Host == "" {
+		errs = append(errs, "DEST_HOST is required")
+	}
+	if cfg.Dest.User == "" {
+		errs = append(errs, "DEST_USER is required")
+	}
+	if cfg.Dest.Password == "" {
+		errs = append(errs, "DEST_PASSWORD (or DEST_PASSWORD_FILE) is required")
 	}
 	switch cfg.SeedDest {
 	case SeedEmpty, SeedAlways, SeedNever:

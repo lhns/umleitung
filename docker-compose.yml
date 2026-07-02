@@ -6,12 +6,16 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      GMAIL_USER: "${GMAIL_USER}"
-      GMAIL_APP_PASSWORD: "${GMAIL_APP_PASSWORD}"
-      STALWART_USER: "${STALWART_USER}"
-      STALWART_APP_PASSWORD: "${STALWART_APP_PASSWORD}"
+      # Example: mirroring Gmail's All Mail into a self-hosted server.
+      SOURCE_HOST: "imap.gmail.com"
+      SOURCE_USER: "${SOURCE_USER}"
+      SOURCE_PASSWORD: "${SOURCE_PASSWORD}"
+      SOURCE_FOLDER: "[Gmail]/All Mail"
+      DEST_HOST: "${DEST_HOST}"
+      DEST_USER: "${DEST_USER}"
+      DEST_PASSWORD: "${DEST_PASSWORD}"
+      DEST_FOLDER: "Mirror"
       # All other settings have sensible defaults; override as needed:
-      # STALWART_FOLDER: "Gmail"
       # POLL_INTERVAL: "900"
       # LOG_LEVEL: "info"
     volumes:

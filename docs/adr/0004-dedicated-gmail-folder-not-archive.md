@@ -1,6 +1,8 @@
-# 0004 — Dedicated `Gmail` destination folder, not `Archive`
+# 0004 — Dedicated destination folder, not `Archive`
 
-Status: accepted
+Status: accepted, amended by [ADR 0009](0009-product-agnostic-source-dest-naming.md)
+(the folder choice is now deployment configuration — code default is `INBOX`,
+the deployment examples use a dedicated `Mirror` folder)
 
 ## Context
 
@@ -18,8 +20,8 @@ stream. Candidate destinations carry different semantics:
 
 ## Decision
 
-Default the destination to a dedicated **`Gmail`** folder, created on startup
-if missing. Keep it fully configurable via `STALWART_FOLDER`, so switching to
+Mirror into a **dedicated destination folder**, created on startup if
+missing. Keep it fully configurable via `DEST_FOLDER`, so switching to
 `Archive`, `INBOX` or anything else is a one-line env change with no rebuild.
 
 ## Consequences
@@ -27,7 +29,7 @@ if missing. Keep it fully configurable via `STALWART_FOLDER`, so switching to
 - Deviates from the spec's stated default; recorded here and in the README.
 - The seeding logic (ADR 0002) targets whatever folder is configured — if a
   prior imapsync bulk import populated a different folder, point
-  `STALWART_FOLDER` at it and seeding prevents re-copying.
+  `DEST_FOLDER` at it and seeding prevents re-copying.
 - Changing the folder *after* mail has been mirrored starts a fresh mirror
   into the new folder (dedup keys seed from the new folder's contents), so
   pick the folder before the first big run.

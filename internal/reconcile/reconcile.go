@@ -31,14 +31,14 @@ type Store interface {
 	SeedBatch(keys []string) error
 }
 
-// Source is the read-only side (Gmail).
+// Source is the read-only side.
 type Source interface {
 	SelectFolder() (uidValidity, uidNext, numMessages uint32, err error)
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
 	FetchFull(uid imap.UID) (*imapx.FullMessage, error)
 }
 
-// Dest is the append-only side (Stalwart).
+// Dest is the append-only side.
 type Dest interface {
 	SelectFolder() (uidValidity, uidNext, numMessages uint32, err error)
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
@@ -117,7 +117,7 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 	}
 
 	// Windowed, resumable scan: [lastUID+1 .. uidNext-1] in UIDBatch windows.
-	// last_uid is committed once per window, so a crash or a Gmail throttle
+	// last_uid is committed once per window, so a crash or a provider-throttle
 	// disconnect resumes from the last committed window.
 	for start := uint32(lastUID) + 1; start < uidNext; start += uint32(r.opts.UIDBatch) {
 		if err := ctx.Err(); err != nil {
@@ -165,7 +165,7 @@ func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 	}
 
 	// Layer 3: destination guard — closes the "appended but not yet
-	// recorded" crash window by asking Stalwart directly.
+	// recorded" crash window by asking the destination directly.
 	if r.opts.DestGuard && IsRealMessageID(key) {
 		has, err := r.dst.HasMessageID(key)
 		if err != nil {
@@ -194,7 +194,7 @@ func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 }
 
 // safeFlags builds the flag set for the destination APPEND: optionally carry
-// \Seen; never propagate anything else (no \Deleted, no \Recent, no Gmail
+// \Seen; never propagate anything else (no \Deleted, no \Recent, no provider-specific
 // labels/keywords).
 func safeFlags(src []imap.Flag, carrySeen bool) []imap.Flag {
 	if carrySeen && slices.Contains(src, imap.FlagSeen) {

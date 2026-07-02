@@ -1,21 +1,24 @@
 # Umleiter
 
-One-way **Gmail → Stalwart** mail mirror. A single small container that
-continuously copies mail from Gmail's `[Gmail]/All Mail` into a folder on a
-self-hosted Stalwart IMAP server — near-real-time via IMAP IDLE, with a
+One-way **IMAP → IMAP** mail mirror. A single small container that
+continuously copies mail from a folder on one IMAP server (source) into a
+folder on another (destination) — near-real-time via IMAP IDLE, with a
 periodic full reconcile as a safety net.
+
+Works with any IMAP servers. Its original use case: mirroring a Gmail
+account's All Mail into a self-hosted mailbox.
 
 ## Guarantees
 
-- **Strictly one-way.** Never writes to Gmail, never deletes on either side.
-  Append-only: the worst any failure can cause is a *temporarily missed*
+- **Strictly one-way.** Never writes to the source, never deletes on either
+  side. Append-only: the worst any failure can cause is a *temporarily missed*
   message, picked up on the next reconcile — never data loss, never corruption.
 - **No duplicates, ever.** Idempotency is keyed on the RFC 5322 `Message-ID`
   header (not on IMAP UIDs, which reset). Three independent layers enforce it:
   1. **Destination seeding** (default on): on first start — or any start where
      local state is empty/lost — the destination folder's existing
      `Message-ID`s are streamed into the dedup set. Correctness never depends
-     on local state; Stalwart itself is the source of truth.
+     on local state; the destination itself is the source of truth.
   2. **Persisted dedup set** in SQLite: indexed per-message lookup (the set is
      never loaded into RAM, so mailbox size doesn't matter). A key is recorded
      only *after* a confirmed successful APPEND — a crash in between leaves
@@ -34,32 +37,32 @@ variants pointing at a file (Docker/Swarm secrets).
 
 | Variable | Default | Description |
 |---|---|---|
-| `GMAIL_HOST` | `imap.gmail.com` | Source IMAPS host |
-| `GMAIL_PORT` | `993` | Source port |
-| `GMAIL_USER` | — (required) | Gmail address |
-| `GMAIL_APP_PASSWORD` / `_FILE` | — (required) | Gmail app password (account needs 2FA) |
-| `GMAIL_FOLDER` | `[Gmail]/All Mail` | Source folder |
-| `GMAIL_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
-| `STALWART_HOST` | `mail.lhns.de` | Destination IMAPS host |
-| `STALWART_PORT` | `993` | Destination port |
-| `STALWART_USER` | — (required) | Stalwart account |
-| `STALWART_APP_PASSWORD` / `_FILE` | — (required) | **Stalwart application password** (not the LDAP password, not OAuth) |
-| `STALWART_FOLDER` | `Gmail` | Destination folder; created if missing |
-| `STALWART_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
+| `SOURCE_HOST` | — (required) | Source IMAP host |
+| `SOURCE_PORT` | `993` | Source port |
+| `SOURCE_USER` | — (required) | Source account |
+| `SOURCE_PASSWORD` / `_FILE` | — (required) | Source password (use an app password where available) |
+| `SOURCE_FOLDER` | `INBOX` | Source folder |
+| `SOURCE_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
+| `DEST_HOST` | — (required) | Destination IMAP host |
+| `DEST_PORT` | `993` | Destination port |
+| `DEST_USER` | — (required) | Destination account |
+| `DEST_PASSWORD` / `_FILE` | — (required) | Destination password (use an app password where available) |
+| `DEST_FOLDER` | `INBOX` | Destination folder; created if missing |
+| `DEST_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
 | `POLL_INTERVAL` | `900` | Seconds between safety-net reconciles |
-| `IDLE_RESET` | `1500` | Max seconds for one IDLE session (Gmail force-logs-out idle connections after ~29 min; go-imap also auto-restarts IDLE every ~28 min) |
+| `IDLE_RESET` | `1500` | Max seconds for one IDLE session (servers force-drop idle connections; go-imap also auto-restarts IDLE every ~28 min) |
 | `STATE_PATH` | `/state/umleiter.db` | SQLite state database |
 | `LOCK_PATH` | `/state/umleiter.lock` | Cross-process startup lock |
 | `SEED_DEST` | `empty` | Seed dedup set from destination: `empty` (only when local set is empty), `always`, `never` |
 | `DEST_GUARD` | `true` | Per-append `SEARCH HEADER Message-ID` on destination |
 | `UID_BATCH` | `2000` | UID window size for the windowed, resumable scan |
-| `CARRY_SEEN` | `true` | Propagate `\Seen` from source (no other flags/labels are ever copied) |
+| `CARRY_SEEN` | `true` | Propagate `\Seen` from source (no other flags/keywords are ever copied) |
 | `HEALTH_ADDR` | `:8080` | `/healthz` liveness endpoint; empty disables |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
-The destination folder is deliberately **not** `Archive` by default: All Mail
-mixes inbox, sent and archived mail, so it lands in a dedicated `Gmail` folder.
-Set `STALWART_FOLDER=Archive` (or anything else) if you prefer.
+Tip: pick a dedicated destination folder (e.g. `Mirror`) rather than `INBOX`
+or `Archive` — mirrored mail stays clearly separated from natively-delivered
+mail and folder semantics stay clean.
 
 ## Deployment
 
@@ -67,7 +70,7 @@ Single container. Compose:
 
 ```sh
 mkdir -p state && chown -R 65532 state   # distroless runs as nonroot (uid 65532)
-GMAIL_USER=... GMAIL_APP_PASSWORD=... STALWART_USER=... STALWART_APP_PASSWORD=... \
+SOURCE_USER=... SOURCE_PASSWORD=... DEST_HOST=... DEST_USER=... DEST_PASSWORD=... \
   docker compose up -d
 ```
 
@@ -82,14 +85,25 @@ stack pins `replicas: 1` — keep it that way.
 - **Back up the state volume** once the initial mirror completes (`/state`);
   it is the dedup fast path. (Losing it is *safe* — seeding rebuilds it from
   the destination — but a backup makes restarts instant.)
-- A large mailbox will hit **Gmail's IMAP download quota (~2.5 GB/day)**. The
-  first full mirror of years of mail may take **days**: Umleiter gets
-  throttled/disconnected, backs off, reconnects and resumes from the last
-  committed window. This is expected, not a bug. Progress is never lost and
-  interrupting/restarting at any point is safe.
-- If Stalwart was **pre-populated by a prior bulk import** (e.g. imapsync into
-  the same folder), the default `SEED_DEST=empty` handles it: existing
-  messages are seeded into the dedup set on first start and never re-copied.
+- Large mailboxes may hit **provider download quotas** and get throttled
+  (see provider notes below). Umleiter treats throttle disconnects as
+  expected: it backs off, reconnects and resumes from the last committed
+  window. Progress is never lost and interrupting/restarting at any point is
+  safe.
+- If the destination was **pre-populated by a prior bulk import** (e.g.
+  imapsync into the same folder), the default `SEED_DEST=empty` handles it:
+  existing messages are seeded into the dedup set on first start and never
+  re-copied.
+
+## Provider notes
+
+- **Gmail as source:** use `SOURCE_FOLDER=[Gmail]/All Mail` to mirror
+  everything (inbox, sent, archived). Requires an app password (account with
+  2FA). Gmail caps IMAP download at roughly ~2.5 GB/day — the first full
+  mirror of years of mail may take days; this is a quota, not a bug. Gmail
+  also force-drops IDLE connections after ~29 minutes; handled automatically.
+- **Stalwart as destination:** use a Stalwart *application password* (not the
+  directory/LDAP password, not OAuth).
 
 ## Edge cases (documented behavior)
 
@@ -97,8 +111,9 @@ stack pins `replicas: 1` — keep it that way.
   SHA-256 of (INTERNALDATE, From, Subject, size). Seeding computes the same
   key from destination copies, so dedup still holds. The destination *guard*
   can't search for synthesized keys — layers 1–2 cover those messages.
-- **Gmail UIDVALIDITY change:** the UID high-water mark is reset and everything
-  is re-scanned; the `Message-ID` set prevents any duplicate appends.
+- **Source UIDVALIDITY change:** the UID high-water mark is reset and
+  everything is re-scanned; the `Message-ID` set prevents any duplicate
+  appends.
 - **Two distinct messages sharing one `Message-ID`** (some spam/forwards): the
   second is treated as already mirrored and skipped — the inherent tradeoff of
   Message-ID dedup (imapsync behaves the same way).
@@ -136,7 +151,7 @@ The battle-tested combination — `mbsync` (isync) driven by `goimapnotify` on
 IDLE events, wrapped in `flock -n` for serialization, with `SyncState` on a
 persistent bind mount — was considered and documented as a fallback. It was
 rejected as the primary approach for one reason: **mbsync keys its sync state
-on UID + journal and explicitly does not dedupe by `Message-ID`**, so a Gmail
+on UID + journal and explicitly does not dedupe by `Message-ID`**, so a
 UIDVALIDITY change or state loss can produce duplicates — the exact failure
 this tool exists to rule out. `imapsync` does dedupe by Message-ID but is a
 large Perl deployment and not IDLE-native. Umleiter reimplements only the

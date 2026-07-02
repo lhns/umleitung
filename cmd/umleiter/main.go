@@ -1,4 +1,4 @@
-// Umleiter — one-way Gmail → Stalwart mail mirror.
+// Umleiter — one-way IMAP → IMAP mail mirror.
 //
 // Single process, single sync loop. Near-real-time via IMAP IDLE with a
 // periodic full reconcile as a safety net. Idempotent by Message-ID:
@@ -38,8 +38,8 @@ func main() {
 
 	log := newLogger(cfg.LogLevel)
 	log.Info("umleiter starting",
-		"source", cfg.Gmail.Addr(), "source_folder", cfg.Gmail.Folder,
-		"dest", cfg.Stalwart.Addr(), "dest_folder", cfg.Stalwart.Folder,
+		"source", cfg.Source.Addr(), "source_folder", cfg.Source.Folder,
+		"dest", cfg.Dest.Addr(), "dest_folder", cfg.Dest.Folder,
 		"poll_interval", cfg.PollInterval, "seed_dest", string(cfg.SeedDest),
 		"dest_guard", cfg.DestGuard, "uid_batch", cfg.UIDBatch)
 
@@ -69,8 +69,9 @@ func main() {
 
 	// Outer supervision loop: (re)connect both sides with exponential
 	// backoff, run the sync loop, and on any connection error start over.
-	// Gmail throttle/quota disconnects land here too — they are expected
-	// during a large first run and simply back off and resume.
+	// Provider throttle/quota disconnects (e.g. Gmail's daily IMAP download
+	// cap) land here too — they are expected during a large first run and
+	// simply back off and resume.
 	backoff := time.Second
 	const maxBackoff = 5 * time.Minute
 	for {
@@ -98,13 +99,13 @@ func main() {
 // runSession connects both endpoints and runs reconcile+IDLE until an error
 // or shutdown. Returning nil means clean shutdown.
 func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log *slog.Logger, healthy *atomic.Int64) error {
-	src, err := imapx.Dial(cfg.Gmail)
+	src, err := imapx.Dial(cfg.Source)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
 
-	dst, err := imapx.Dial(cfg.Stalwart)
+	dst, err := imapx.Dial(cfg.Dest)
 	if err != nil {
 		return err
 	}
@@ -125,7 +126,7 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 		CarrySeen: cfg.CarrySeen,
 	}, log)
 
-	// Destination seeding: bootstrap the dedup set from what Stalwart
+	// Destination seeding: bootstrap the dedup set from what the destination
 	// already holds, so correctness never depends on local state.
 	if err := maybeSeed(ctx, cfg, store, rec, log); err != nil {
 		return err
@@ -189,7 +190,7 @@ func maybeSeed(ctx context.Context, cfg *config.Config, store *state.Store, rec 
 	if !seed {
 		return nil
 	}
-	log.Info("seeding dedup set from destination folder", "folder", cfg.Stalwart.Folder)
+	log.Info("seeding dedup set from destination folder", "folder", cfg.Dest.Folder)
 	start := time.Now()
 	n, err := rec.SeedFromDest(ctx)
 	if err != nil {

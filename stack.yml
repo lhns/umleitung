@@ -3,25 +3,29 @@
 #   docker stack deploy -c stack.yml umleiter
 #
 # Requires external secrets:
-#   printf '%s' 'the-gmail-app-password'    | docker secret create gmail_app_password -
-#   printf '%s' 'the-stalwart-app-password' | docker secret create stalwart_app_password -
+#   printf '%s' 'the-source-password' | docker secret create umleiter_source_password -
+#   printf '%s' 'the-dest-password'   | docker secret create umleiter_dest_password -
 services:
   umleiter:
     image: ghcr.io/lhns/umleitung:latest
     environment:
-      GMAIL_USER: "pierrekisters@gmail.com"
-      GMAIL_APP_PASSWORD_FILE: /run/secrets/gmail_app_password
-      STALWART_USER: "pierrekisters@lhns.de"
-      STALWART_APP_PASSWORD_FILE: /run/secrets/stalwart_app_password
-      # STALWART_FOLDER: "Gmail"     # default; change to Archive/INBOX if preferred
+      # Example: mirroring a Gmail account into a self-hosted Stalwart server.
+      SOURCE_HOST: "imap.gmail.com"
+      SOURCE_USER: "user@gmail.com"
+      SOURCE_PASSWORD_FILE: /run/secrets/umleiter_source_password
+      SOURCE_FOLDER: "[Gmail]/All Mail"
+      DEST_HOST: "mail.example.org"
+      DEST_USER: "user@example.org"
+      DEST_PASSWORD_FILE: /run/secrets/umleiter_dest_password
+      DEST_FOLDER: "Mirror"
       # POLL_INTERVAL: "900"
     volumes:
       # State volume = dedup fast path. Persistent bind mount; back it up
       # before the first big run. Owner must be uid 65532 (distroless nonroot).
       - /srv/mail/umleiter/state:/state
     secrets:
-      - gmail_app_password
-      - stalwart_app_password
+      - umleiter_source_password
+      - umleiter_dest_password
     healthcheck:
       test: ["CMD", "/umleiter", "-healthcheck"]
       interval: 60s
@@ -37,7 +41,7 @@ services:
         delay: 10s
 
 secrets:
-  gmail_app_password:
+  umleiter_source_password:
     external: true
-  stalwart_app_password:
+  umleiter_dest_password:
     external: true
