@@ -54,7 +54,7 @@ type Source interface {
 	ListFolders() ([]imapx.FolderInfo, error)
 	SearchAllUIDs() ([]imap.UID, error)
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
-	FetchFull(uid imap.UID) (*imapx.FullMessage, error)
+	FetchFullStream(uids []imap.UID, fn func(*imapx.FullMessage) error) error
 }
 
 // Dest is the append-mostly side. The only mutations of existing messages
@@ -62,7 +62,7 @@ type Source interface {
 type Dest interface {
 	SelectNamedFolder(name string) (uidValidity, uidNext, numMessages uint32, err error)
 	FetchMetaRange(start, stop imap.UID) ([]imapx.MsgMeta, error)
-	HasMessageIDIn(folder, messageID string) (bool, error)
+	SearchMessageIDsIn(folder string, ids []string) (map[string]bool, error)
 	AppendTo(folder string, msg *imapx.FullMessage, flags []imap.Flag) error
 	MoveMessageID(fromFolder, toFolder, messageID string) (bool, error)
 	MoveUIDs(uids []imap.UID, toFolder string) error
@@ -200,13 +200,8 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 		}
 		sum.Candidates += len(metas)
 
-		for i := range metas {
-			if err := ctx.Err(); err != nil {
-				return sum, err
-			}
-			if err := r.mirrorOne(&metas[i], sum); err != nil {
-				return sum, fmt.Errorf("uid %d: %w", metas[i].UID, err)
-			}
+		if err := r.mirrorWindow(ctx, metas, sum); err != nil {
+			return sum, fmt.Errorf("window %d:%d: %w", start, stop, err)
 		}
 
 		// Per-window high-water-mark commit (resumable first run).
@@ -232,59 +227,171 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 	return sum, nil
 }
 
-// mirrorOne applies the three dedup layers to a single candidate and appends
-// it — routed to the correct destination folder — if and only if it is
-// genuinely new.
-func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
-	key := DedupKey(m)
+// pendingCopy is a classified candidate awaiting its body copy.
+type pendingCopy struct {
+	uid        imap.UID
+	key        string
+	destFolder string
+}
 
-	// Layer 2: persisted dedup set (indexed lookup, fast path).
-	seen, err := r.store.HasKey(key)
-	if err != nil {
-		return err
-	}
-	if seen {
-		sum.SkippedDup++
-		return nil
-	}
+// pipelineDepth bounds in-flight messages between the Gmail fetch stream and
+// the Stalwart append consumer (memory bound: depth × message size).
+const pipelineDepth = 8
 
-	// Routing: inbox members -> primary folder, everything else -> archive.
-	destFolder, err := r.destFolderFor(key)
-	if err != nil {
-		return err
-	}
-
-	// Layer 3: destination guard — closes the "appended but not yet
-	// recorded" crash window by asking the destination directly. With
-	// routing, the copy may have been moved: check both folders.
-	if r.opts.DestGuard && IsRealMessageID(key) {
-		has, err := r.dst.HasMessageIDIn(destFolder, key)
+// mirrorWindow mirrors one window of candidates in three passes:
+//  1. classify (local): dedup lookup + routing per candidate
+//  2. batched destination guard: ONE Message-ID batch search per dest folder
+//     (every candidate is still guarded — only the transport is batched)
+//  3. copy: one streaming FETCH for all pending bodies, appends running
+//     concurrently in a bounded FIFO pipeline (append-then-record per
+//     message, exactly as before)
+func (r *Reconciler) mirrorWindow(ctx context.Context, metas []imapx.MsgMeta, sum *Summary) error {
+	// Pass 1: classification.
+	var pend []pendingCopy
+	for i := range metas {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		key := DedupKey(&metas[i])
+		seen, err := r.store.HasKey(key)
 		if err != nil {
 			return err
 		}
-		if !has {
-			if other := r.otherDestFolder(destFolder); other != "" {
-				if has, err = r.dst.HasMessageIDIn(other, key); err != nil {
+		if seen {
+			sum.SkippedDup++
+			continue
+		}
+		destFolder, err := r.destFolderFor(key)
+		if err != nil {
+			return err
+		}
+		pend = append(pend, pendingCopy{uid: metas[i].UID, key: key, destFolder: destFolder})
+	}
+	if len(pend) == 0 {
+		return nil
+	}
+
+	// Pass 2: batched destination guard (both folders under routing — the
+	// copy may have been moved).
+	if r.opts.DestGuard {
+		var ids []string
+		for _, p := range pend {
+			if IsRealMessageID(p.key) {
+				ids = append(ids, p.key)
+			}
+		}
+		found := map[string]bool{}
+		if len(ids) > 0 {
+			folders := []string{r.opts.DestFolder}
+			if r.opts.ArchiveRouting {
+				folders = append(folders, r.opts.ArchiveFolder)
+			}
+			for _, folder := range folders {
+				f, err := r.dst.SearchMessageIDsIn(folder, ids)
+				if err != nil {
 					return err
+				}
+				for id := range f {
+					found[id] = true
 				}
 			}
 		}
-		if has {
-			sum.SkippedDup++
-			return r.store.RecordKey(key, uint32(m.UID), r.now().Unix())
+		kept := pend[:0]
+		for _, p := range pend {
+			if found[p.key] {
+				sum.SkippedDup++
+				if err := r.store.RecordKey(p.key, uint32(p.uid), r.now().Unix()); err != nil {
+					return err
+				}
+				continue
+			}
+			kept = append(kept, p)
+		}
+		pend = kept
+		if len(pend) == 0 {
+			return nil
 		}
 	}
 
-	full, err := r.src.FetchFull(m.UID)
-	if err != nil {
-		return err
+	// Pass 3: streamed copy with a bounded fetch/append pipeline.
+	return r.copyPipeline(ctx, pend, sum)
+}
+
+type copyItem struct {
+	full *imapx.FullMessage
+	pc   pendingCopy
+}
+
+// copyPipeline overlaps the Gmail body stream (producer) with Stalwart
+// appends (consumer). Single producer + single consumer = FIFO order; the
+// consumer alone touches the store (append-then-record per message).
+func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *Summary) error {
+	byUID := make(map[imap.UID]pendingCopy, len(pend))
+	uids := make([]imap.UID, 0, len(pend))
+	for _, p := range pend {
+		byUID[p.uid] = p
+		uids = append(uids, p.uid)
 	}
 
+	ch := make(chan copyItem, pipelineDepth)
+	failed := make(chan struct{}) // closed by consumer on first error
+	done := make(chan struct{})
+	var consErr error
+
+	go func() {
+		defer close(done)
+		copied := 0
+		for it := range ch {
+			if consErr != nil {
+				continue // drain so the producer never blocks
+			}
+			if err := r.appendOne(it.pc, it.full); err != nil {
+				consErr = fmt.Errorf("uid %d: %w", it.pc.uid, err)
+				close(failed)
+				continue
+			}
+			sum.Copied++
+			copied++
+			if copied%200 == 0 {
+				r.opts.progress("mirror", "", sum.Copied)
+			}
+		}
+	}()
+
+	prodErr := r.src.FetchFullStream(uids, func(full *imapx.FullMessage) error {
+		pc, ok := byUID[full.UID]
+		if !ok {
+			return nil // unexpected UID in response; ignore
+		}
+		select {
+		case ch <- copyItem{full: full, pc: pc}:
+			return nil
+		case <-failed:
+			return fmt.Errorf("append side failed")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	close(ch)
+	<-done
+
+	if consErr != nil {
+		return consErr
+	}
+	if prodErr != nil {
+		return prodErr
+	}
+	return ctx.Err()
+}
+
+// appendOne appends a fetched message to its routed folder and records the
+// dedup key — APPEND first, record after, never the other way around.
+func (r *Reconciler) appendOne(pc pendingCopy, full *imapx.FullMessage) error {
 	baseFlags := safeFlags(full.Flags, r.opts.CarrySeen)
 	flags := baseFlags
 	var keywords []imap.Flag
 	if r.opts.SyncLabels {
-		labels, err := r.labelsFor(key)
+		labels, err := r.labelsFor(pc.key)
 		if err != nil {
 			return err
 		}
@@ -292,24 +399,19 @@ func (r *Reconciler) mirrorOne(m *imapx.MsgMeta, sum *Summary) error {
 		flags = append(append([]imap.Flag{}, baseFlags...), keywords...)
 	}
 
-	// APPEND first, record after — never the other way around.
-	if err := r.dst.AppendTo(destFolder, full, flags); err != nil {
+	if err := r.dst.AppendTo(pc.destFolder, full, flags); err != nil {
 		if len(keywords) == 0 {
 			return err
 		}
 		// The mirror always wins over label decoration: retry once without
 		// keywords before treating this as an error.
 		r.log.Warn("append with label keywords failed; retrying without keywords",
-			"uid", m.UID, "keywords", len(keywords), "err", err)
-		if err := r.dst.AppendTo(destFolder, full, baseFlags); err != nil {
+			"uid", pc.uid, "keywords", len(keywords), "err", err)
+		if err := r.dst.AppendTo(pc.destFolder, full, baseFlags); err != nil {
 			return err
 		}
 	}
-	if err := r.store.RecordKey(key, uint32(m.UID), r.now().Unix()); err != nil {
-		return err
-	}
-	sum.Copied++
-	return nil
+	return r.store.RecordKey(pc.key, uint32(pc.uid), r.now().Unix())
 }
 
 // safeFlags builds the flag set for the destination APPEND: optionally carry

@@ -225,13 +225,24 @@ func (f *fakeSource) SearchAllUIDs() ([]imap.UID, error) {
 	return out, nil
 }
 
-func (f *fakeSource) FetchFull(uid imap.UID) (*imapx.FullMessage, error) {
+func (f *fakeSource) FetchFullStream(uids []imap.UID, fn func(*imapx.FullMessage) error) error {
+	want := map[imap.UID]bool{}
+	for _, u := range uids {
+		want[u] = true
+	}
 	for _, m := range f.selectedMsgs() {
-		if m.meta.UID == uid {
-			return &imapx.FullMessage{Raw: []byte(m.raw), InternalDate: m.meta.InternalDate}, nil
+		if !want[m.meta.UID] {
+			continue
+		}
+		err := fn(&imapx.FullMessage{
+			UID: m.meta.UID, Raw: []byte(m.raw),
+			Flags: m.meta.Flags, InternalDate: m.meta.InternalDate,
+		})
+		if err != nil {
+			return err
 		}
 	}
-	return nil, fmt.Errorf("uid %d not found", uid)
+	return nil
 }
 
 const (
@@ -256,9 +267,11 @@ type fakeDest struct {
 	appendedTo     []string      // folder per append
 	moves          int
 	appendErr      error
+	failAppendAt   int // fail the Nth append (1-based; 0 = never)
 	rejectKeywords bool // reject any APPEND carrying non-\Seen flags
 	noArbitraryKw  bool
 	selected       string
+	guardSearches  int // SearchMessageIDsIn call count
 }
 
 func newFakeDest() *fakeDest {
@@ -306,10 +319,23 @@ func (d *fakeDest) HasMessageIDIn(folder, mid string) (bool, error) {
 	}
 	return false, nil
 }
+func (d *fakeDest) SearchMessageIDsIn(folder string, ids []string) (map[string]bool, error) {
+	d.guardSearches++
+	found := map[string]bool{}
+	for _, id := range ids {
+		if has, _ := d.HasMessageIDIn(folder, id); has {
+			found[id] = true
+		}
+	}
+	return found, nil
+}
 func (d *fakeDest) SupportsArbitraryKeywords() bool { return !d.noArbitraryKw }
 func (d *fakeDest) AppendTo(folder string, msg *imapx.FullMessage, flags []imap.Flag) error {
 	if d.appendErr != nil {
 		return d.appendErr
+	}
+	if d.failAppendAt > 0 && len(d.appended)+1 == d.failAppendAt {
+		return fmt.Errorf("append %d failed (injected)", d.failAppendAt)
 	}
 	if d.rejectKeywords {
 		for _, f := range flags {
@@ -623,6 +649,99 @@ func TestSeedFromDestPreventsRecopy(t *testing.T) {
 	}
 	if sum.Copied != 1 || sum.SkippedDup != 2 {
 		t.Fatalf("after seed: %+v, want 1 copied 2 skipped", sum)
+	}
+}
+
+// The guard must issue ONE batched search per dest folder per window — not
+// per message — while still catching every pre-existing message.
+func TestGuardIsBatchedPerWindow(t *testing.T) {
+	store := newFakeStore()
+	var msgs []fakeMsg
+	for i := uint32(1); i <= 5; i++ {
+		msgs = append(msgs, msg(i, fmt.Sprintf("<g%d@x>", i), fmt.Sprintf("raw-g%d", i)))
+	}
+	src := &fakeSource{uidValidity: 7, msgs: msgs}
+	dst := newFakeDest()
+	dst.addExisting(fakeDestFolder, "<g3@x>", "raw-g3-preexisting")
+	rec := newRec(store, src, dst, Options{DestGuard: true, UIDBatch: 100})
+
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 4 || sum.SkippedDup != 1 {
+		t.Fatalf("got %+v, want 4 copied / 1 skipped (g3 pre-existing)", sum)
+	}
+	if dst.guardSearches != 1 {
+		t.Fatalf("guard searches = %d, want 1 (one batch per folder per window)", dst.guardSearches)
+	}
+	if dst.total() != 5 {
+		t.Fatalf("dest total = %d, want 5 (no duplicate of g3)", dst.total())
+	}
+	// The pre-existing message must be recorded (self-heal), not re-appended.
+	if !store.keys["<g3@x>"] {
+		t.Fatal("guard hit not recorded")
+	}
+}
+
+// Synthesized keys are unsearchable and must never reach the guard query.
+func TestGuardExcludesSynthesizedKeys(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{uidValidity: 7, msgs: []fakeMsg{msg(1, "", "raw-nomid")}}
+	dst := newFakeDest()
+	rec := newRec(store, src, dst, Options{DestGuard: true})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if dst.guardSearches != 0 {
+		t.Fatalf("guard searched for synthesized keys (%d calls)", dst.guardSearches)
+	}
+	if dst.total() != 1 {
+		t.Fatalf("message not mirrored: %d", dst.total())
+	}
+}
+
+// Pipeline: appends preserve source order, and a mid-stream append failure
+// aborts the pass with already-appended messages recorded (resume-safe).
+func TestPipelineOrderAndMidStreamFailure(t *testing.T) {
+	store := newFakeStore()
+	var msgs []fakeMsg
+	for i := uint32(1); i <= 6; i++ {
+		msgs = append(msgs, msg(i, fmt.Sprintf("<s%d@x>", i), fmt.Sprintf("raw-s%d", i)))
+	}
+	src := &fakeSource{uidValidity: 7, msgs: msgs}
+	dst := newFakeDest()
+	dst.failAppendAt = 4 // 4th append errors
+	rec := newRec(store, src, dst, Options{UIDBatch: 100})
+
+	if _, err := rec.Run(context.Background()); err == nil {
+		t.Fatal("want error from mid-stream append failure")
+	}
+	// Exactly 3 appended, in source order, all recorded.
+	if len(dst.appended) != 3 {
+		t.Fatalf("appended %d, want 3", len(dst.appended))
+	}
+	for i, raw := range []string{"raw-s1", "raw-s2", "raw-s3"} {
+		if dst.appended[i] != raw {
+			t.Fatalf("append order broken: %v", dst.appended)
+		}
+		if !store.keys[fmt.Sprintf("<s%d@x>", i+1)] {
+			t.Fatalf("appended message s%d not recorded", i+1)
+		}
+	}
+	// last_uid must NOT have advanced past the failed window.
+	if store.lastUID != 0 {
+		t.Fatalf("last_uid advanced to %d despite failed window", store.lastUID)
+	}
+
+	// Recovery: the failed and remaining messages copy exactly once.
+	dst.failAppendAt = 0
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 3 || dst.total() != 6 {
+		t.Fatalf("resume: %+v total=%d, want 3 copied / 6 total", sum, dst.total())
 	}
 }
 

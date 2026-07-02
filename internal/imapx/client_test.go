@@ -36,6 +36,28 @@ func TestParseMetaHeaderMissingMessageID(t *testing.T) {
 	}
 }
 
+func TestOrMessageIDCriteria(t *testing.T) {
+	// 1 id: plain header criterion, no OR.
+	c1 := orMessageIDCriteria([]string{"<a@x>"})
+	if len(c1.Or) != 0 || len(c1.Header) != 1 || c1.Header[0].Value != "<a@x>" {
+		t.Fatalf("single: %+v", c1)
+	}
+	// 2 ids: one OR pair.
+	c2 := orMessageIDCriteria([]string{"<a@x>", "<b@x>"})
+	if len(c2.Or) != 1 || c2.Or[0][0].Header[0].Value != "<a@x>" || c2.Or[0][1].Header[0].Value != "<b@x>" {
+		t.Fatalf("pair: %+v", c2)
+	}
+	// 3 ids: nested OR tree, rightmost leaf carries the last id.
+	c3 := orMessageIDCriteria([]string{"<a@x>", "<b@x>", "<c@x>"})
+	if len(c3.Or) != 1 || c3.Or[0][0].Header[0].Value != "<a@x>" {
+		t.Fatalf("tree root: %+v", c3)
+	}
+	inner := c3.Or[0][1]
+	if len(inner.Or) != 1 || inner.Or[0][0].Header[0].Value != "<b@x>" || inner.Or[0][1].Header[0].Value != "<c@x>" {
+		t.Fatalf("tree inner: %+v", inner)
+	}
+}
+
 func TestParseMetaHeaderEmpty(t *testing.T) {
 	if mid, from, subject := parseMetaHeader(nil); mid != "" || from != "" || subject != "" {
 		t.Fatal("non-empty result for empty header")

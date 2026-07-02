@@ -32,6 +32,7 @@ type MsgMeta struct {
 
 // FullMessage is a complete message ready to be appended to the destination.
 type FullMessage struct {
+	UID          imap.UID
 	Raw          []byte
 	Flags        []imap.Flag
 	InternalDate time.Time
@@ -213,7 +214,11 @@ var metaSection = &imap.FetchItemBodySection{
 // start <= UID <= stop, in one FETCH round trip, ascending by UID.
 // Non-existent UIDs in the range are simply absent from the result.
 func (cl *Client) FetchMetaRange(start, stop imap.UID) ([]MsgMeta, error) {
-	uidSet := imap.UIDSet{imap.UIDRange{Start: start, Stop: stop}}
+	return cl.fetchMetas(imap.UIDSet{imap.UIDRange{Start: start, Stop: stop}})
+}
+
+// fetchMetas fetches MsgMeta for an arbitrary UID set, ascending by UID.
+func (cl *Client) fetchMetas(uidSet imap.UIDSet) ([]MsgMeta, error) {
 	fetchOpts := &imap.FetchOptions{
 		UID:          true,
 		InternalDate: true,
@@ -231,7 +236,7 @@ func (cl *Client) FetchMetaRange(start, stop imap.UID) ([]MsgMeta, error) {
 		buf, err := msg.Collect()
 		if err != nil {
 			cmd.Close()
-			return nil, fmt.Errorf("fetch meta %d:%d: %w", start, stop, err)
+			return nil, fmt.Errorf("fetch metas: %w", err)
 		}
 		hdr := buf.FindBodySection(metaSection)
 		mid, from, subject := parseMetaHeader(hdr)
@@ -246,12 +251,63 @@ func (cl *Client) FetchMetaRange(start, stop imap.UID) ([]MsgMeta, error) {
 		})
 	}
 	if err := cmd.Close(); err != nil {
-		return nil, fmt.Errorf("fetch meta %d:%d: %w", start, stop, err)
+		return nil, fmt.Errorf("fetch metas: %w", err)
 	}
 	// Servers may return any order; sort ascending so the caller's
 	// high-water-mark logic is correct.
 	sortMetas(metas)
 	return metas, nil
+}
+
+// guardChunk bounds Message-IDs per SEARCH command (command-length limits).
+const guardChunk = 100
+
+// SearchMessageIDsIn reports which of the given Message-IDs exist in the
+// named folder. Batched: one `UID SEARCH` per chunk of ~100 ids (an OR-tree
+// of HEADER criteria); only chunks with hits cost an extra header fetch to
+// identify which ids matched. Used by the mirror's destination guard.
+func (cl *Client) SearchMessageIDsIn(folder string, ids []string) (map[string]bool, error) {
+	found := map[string]bool{}
+	if len(ids) == 0 {
+		return found, nil
+	}
+	if err := cl.ensureSelected(folder); err != nil {
+		return nil, err
+	}
+	for chunk := range slices.Chunk(ids, guardChunk) {
+		data, err := cl.c.UIDSearch(orMessageIDCriteria(chunk), nil).Wait()
+		if err != nil {
+			return nil, fmt.Errorf("batch Message-ID search on %s: %w", cl.ep.Addr(), err)
+		}
+		uids := data.AllUIDs()
+		if len(uids) == 0 {
+			continue
+		}
+		metas, err := cl.fetchMetas(imap.UIDSetNum(uids...))
+		if err != nil {
+			return nil, err
+		}
+		for i := range metas {
+			if metas[i].MessageID != "" {
+				found[metas[i].MessageID] = true
+			}
+		}
+	}
+	return found, nil
+}
+
+// orMessageIDCriteria builds `HEADER Message-Id a OR ... OR z` as the nested
+// OR-pair tree the IMAP grammar requires.
+func orMessageIDCriteria(ids []string) *imap.SearchCriteria {
+	single := imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: ids[0]}},
+	}
+	if len(ids) == 1 {
+		return &single
+	}
+	return &imap.SearchCriteria{
+		Or: [][2]imap.SearchCriteria{{single, *orMessageIDCriteria(ids[1:])}},
+	}
 }
 
 // FetchFull fetches the complete raw message, flags and INTERNALDATE for one UID.
@@ -291,6 +347,51 @@ func (cl *Client) FetchFull(uid imap.UID) (*FullMessage, error) {
 		return nil, fmt.Errorf("fetch full uid %d: message vanished or empty", uid)
 	}
 	return full, nil
+}
+
+// FetchFullStream fetches complete messages for the given UIDs in ONE FETCH
+// command, invoking fn per message as bodies stream in (bounded memory: one
+// message buffered at a time). fn returning an error aborts the stream.
+func (cl *Client) FetchFullStream(uids []imap.UID, fn func(*FullMessage) error) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	bodySection := &imap.FetchItemBodySection{Peek: true} // BODY.PEEK[] = whole message
+	fetchOpts := &imap.FetchOptions{
+		UID:          true,
+		Flags:        true,
+		InternalDate: true,
+		BodySection:  []*imap.FetchItemBodySection{bodySection},
+	}
+	cmd := cl.c.Fetch(imap.UIDSetNum(uids...), fetchOpts)
+	for {
+		msg := cmd.Next()
+		if msg == nil {
+			break
+		}
+		buf, err := msg.Collect()
+		if err != nil {
+			cmd.Close()
+			return fmt.Errorf("fetch full stream: %w", err)
+		}
+		raw := buf.FindBodySection(bodySection)
+		if len(raw) == 0 {
+			continue // vanished mid-fetch; next reconcile retries
+		}
+		if err := fn(&FullMessage{
+			UID:          buf.UID,
+			Raw:          raw,
+			Flags:        buf.Flags,
+			InternalDate: buf.InternalDate,
+		}); err != nil {
+			cmd.Close()
+			return err
+		}
+	}
+	if err := cmd.Close(); err != nil {
+		return fmt.Errorf("fetch full stream: %w", err)
+	}
+	return nil
 }
 
 // HasMessageID searches the currently selected folder for a Message-ID
