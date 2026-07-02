@@ -1,0 +1,7 @@
+/umleiter
+/umleiter.exe
+/state/
+*.db
+*.db-wal
+*.db-shm
+.env

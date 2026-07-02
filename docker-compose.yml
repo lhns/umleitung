@@ -1,0 +1,25 @@
+# Simple docker-compose deployment (single container, env-file config).
+# For Docker Swarm with secrets, see stack.yml instead.
+services:
+  umleiter:
+    image: ghcr.io/lhns/umleitung:latest
+    build: .
+    restart: unless-stopped
+    environment:
+      GMAIL_USER: "${GMAIL_USER}"
+      GMAIL_APP_PASSWORD: "${GMAIL_APP_PASSWORD}"
+      STALWART_USER: "${STALWART_USER}"
+      STALWART_APP_PASSWORD: "${STALWART_APP_PASSWORD}"
+      # All other settings have sensible defaults; override as needed:
+      # STALWART_FOLDER: "Gmail"
+      # POLL_INTERVAL: "900"
+      # LOG_LEVEL: "info"
+    volumes:
+      # The state volume is the dedup fast path — persistent, backed up.
+      # Owner must be uid 65532 (distroless nonroot): chown -R 65532 ./state
+      - ./state:/state
+    healthcheck:
+      test: ["CMD", "/umleiter", "-healthcheck"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
