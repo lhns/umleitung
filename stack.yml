@@ -13,7 +13,7 @@ services:
       SOURCE_HOST: "imap.gmail.com"
       SOURCE_USER: "user@gmail.com"
       SOURCE_PASSWORD_FILE: /run/secrets/umleiter_source_password
-      SOURCE_FOLDER: "[Gmail]/All Mail"
+      SOURCE_FOLDER: '\All'           # special-use selector; resolves localized Gmail folder names (single-quote: backslash)
       DEST_HOST: "mail.example.org"
       DEST_USER: "user@example.org"
       DEST_PASSWORD_FILE: /run/secrets/umleiter_dest_password

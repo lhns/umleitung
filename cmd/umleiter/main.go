@@ -107,6 +107,16 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 	}
 	defer src.Close()
 
+	// Resolve special-use selectors (e.g. SOURCE_FOLDER=\All) to the actual,
+	// possibly localized folder name (German Gmail: [Gmail]/Alle Nachrichten).
+	srcFolder, err := src.ResolveSpecialUse()
+	if err != nil {
+		return err
+	}
+	if srcFolder != cfg.Source.Folder {
+		log.Info("resolved special-use source folder", "selector", cfg.Source.Folder, "folder", srcFolder)
+	}
+
 	dst, err := imapx.Dial(cfg.Dest)
 	if err != nil {
 		return err
@@ -132,7 +142,7 @@ func runSession(ctx context.Context, cfg *config.Config, store *state.Store, log
 		DestGuard:      cfg.DestGuard,
 		CarrySeen:      cfg.CarrySeen,
 		SyncLabels:     cfg.SyncLabels,
-		SourceFolder:   cfg.Source.Folder,
+		SourceFolder:   srcFolder,
 		LabelExclude:   cfg.LabelExclude,
 		DestFolder:     cfg.Dest.Folder,
 		ArchiveRouting: cfg.ArchiveRouting,

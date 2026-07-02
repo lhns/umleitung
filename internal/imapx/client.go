@@ -144,9 +144,14 @@ func (cl *Client) SearchAllUIDs() ([]imap.UID, error) {
 // advertised PERMANENTFLAGS \* (arbitrary keywords may be stored).
 func (cl *Client) SupportsArbitraryKeywords() bool { return cl.arbitraryKeywords }
 
-// ListFolders lists all folders on the server.
+// ListFolders lists all folders on the server, with special-use attributes
+// when the server supports RFC 6154.
 func (cl *Client) ListFolders() ([]FolderInfo, error) {
-	cmd := cl.c.List("", "*", nil)
+	var opts *imap.ListOptions
+	if cl.c.Caps().Has(imap.CapSpecialUse) {
+		opts = &imap.ListOptions{ReturnSpecialUse: true}
+	}
+	cmd := cl.c.List("", "*", opts)
 	data, err := cmd.Collect()
 	if err != nil {
 		return nil, fmt.Errorf("list folders on %s: %w", cl.ep.Addr(), err)
@@ -156,6 +161,29 @@ func (cl *Client) ListFolders() ([]FolderInfo, error) {
 		folders = append(folders, FolderInfo{Name: d.Mailbox, Attrs: d.Attrs})
 	}
 	return folders, nil
+}
+
+// ResolveSpecialUse resolves a special-use folder selector in the endpoint's
+// configured folder (e.g. `\All`, `\Sent` — RFC 6154) to the server's actual
+// folder name, which providers localize (German Gmail exposes All Mail as
+// "[Gmail]/Alle Nachrichten"). Plain folder names pass through unchanged.
+// The resolved name becomes the client's working folder.
+func (cl *Client) ResolveSpecialUse() (string, error) {
+	if !strings.HasPrefix(cl.ep.Folder, `\`) {
+		return cl.ep.Folder, nil
+	}
+	attr := imap.MailboxAttr(cl.ep.Folder)
+	folders, err := cl.ListFolders()
+	if err != nil {
+		return "", err
+	}
+	for _, f := range folders {
+		if slices.Contains(f.Attrs, attr) {
+			cl.ep.Folder = f.Name
+			return f.Name, nil
+		}
+	}
+	return "", fmt.Errorf("no folder with special-use attribute %q on %s (server caps missing SPECIAL-USE, or attribute not present)", attr, cl.ep.Addr())
 }
 
 // EnsureFolder creates the endpoint's default folder if it does not exist yet.

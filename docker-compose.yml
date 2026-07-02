@@ -10,7 +10,7 @@ services:
       SOURCE_HOST: "imap.gmail.com"
       SOURCE_USER: "${SOURCE_USER}"
       SOURCE_PASSWORD: "${SOURCE_PASSWORD}"
-      SOURCE_FOLDER: "[Gmail]/All Mail"
+      SOURCE_FOLDER: '\All'           # special-use selector; resolves localized Gmail folder names (single-quote: backslash)
       DEST_HOST: "${DEST_HOST}"
       DEST_USER: "${DEST_USER}"
       DEST_PASSWORD: "${DEST_PASSWORD}"

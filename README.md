@@ -41,7 +41,7 @@ variants pointing at a file (Docker/Swarm secrets).
 | `SOURCE_PORT` | `993` | Source port |
 | `SOURCE_USER` | — (required) | Source account |
 | `SOURCE_PASSWORD` / `_FILE` | — (required) | Source password (use an app password where available) |
-| `SOURCE_FOLDER` | `INBOX` | Source folder |
+| `SOURCE_FOLDER` | `INBOX` | Source folder; accepts a special-use selector like `\All` or `\Sent` (RFC 6154), resolved to the server's actual — possibly localized — folder name at connect time |
 | `SOURCE_TLS` | `true` | Implicit TLS (IMAPS); disable only for local testing |
 | `DEST_HOST` | — (required) | Destination IMAP host |
 | `DEST_PORT` | `993` | Destination port |
@@ -200,9 +200,16 @@ stack pins `replicas: 1` — keep it that way.
 
 ## Provider notes
 
-- **Gmail as source:** use `SOURCE_FOLDER=[Gmail]/All Mail` to mirror
-  everything (inbox, sent, archived). Requires an app password (account with
-  2FA). Gmail caps IMAP download at roughly ~2.5 GB/day — the first full
+- **Gmail as source:** to mirror everything (inbox, sent, archived), set
+  `SOURCE_FOLDER` to your account's All-Mail folder. **Gmail localizes its
+  special folder names over IMAP per account language**: `[Gmail]/All Mail`
+  on English accounts, `[Gmail]/Alle Nachrichten` on German ones, etc. Either
+  set the exact localized name, or set the explicit special-use selector
+  `SOURCE_FOLDER=\All` (RFC 6154), which resolves to that folder by its
+  `\All` attribute regardless of language. `INBOX` is never localized (the
+  name is reserved by the IMAP protocol; "Posteingang" is only the UI label),
+  so `SOURCE_INBOX=INBOX` always works. Requires an app password (account
+  with 2FA). Gmail caps IMAP download at roughly ~2.5 GB/day — the first full
   mirror of years of mail may take days; this is a quota, not a bug. Gmail
   also force-drops IDLE connections after ~29 minutes; handled automatically.
   Gmail **labels** appear as IMAP folders → `SYNC_LABELS=true` mirrors them
@@ -217,28 +224,11 @@ stack pins `replicas: 1` — keep it that way.
 ## Troubleshooting connections
 
 Umleiter retries any connection failure with exponential backoff (1s → 5min)
-and resumes exactly where it left off — a provider outage needs no action.
-To find out *whose* fault a failure is, in one minute:
-
-```sh
-# 1. Is it the app or the network/provider? Test raw TLS from the same network:
-openssl s_client -connect imap.gmail.com:993 -servername imap.gmail.com </dev/null
-# 2. Provider-side or network-side? Compare sibling endpoints:
-openssl s_client -connect smtp.gmail.com:465 </dev/null   # works?
-openssl s_client -connect pop.gmail.com:995  </dev/null   # works?
-```
-
-- All three fail → your network/DNS.
-- Only the IMAP endpoint fails (e.g. `alert decode error` / alert 50) while
-  SMTP/POP handshake fine → **provider-side fault**; nothing to fix locally,
-  Umleiter reconnects automatically when it recovers. (Observed in the wild
-  with `imap.gmail.com:993` rejecting every TLS stack while all other Google
-  endpoints worked.)
-- Only the *app* fails while `openssl` works → check `SOURCE_TLS`/ports, then
-  file a bug.
-- On container overlay networks, also consider MTU: large TLS handshakes can
-  be dropped by a mis-sized overlay (set e.g.
-  `com.docker.network.driver.mtu: 1400`).
+and resumes exactly where it left off — transient outages need no action.
+For persistent failures, sanity-check the endpoint from the same network the
+container uses (`openssl s_client -connect host:993`); on container overlay
+networks also check the MTU (a mis-sized overlay can drop large TLS
+handshakes — set e.g. `com.docker.network.driver.mtu: 1400`).
 
 ## Edge cases (documented behavior)
 
