@@ -45,35 +45,41 @@ func isLabelFolder(f imapx.FolderInfo, sourceFolder string, exclude map[string]b
 
 // keywordFor maps a label (folder name) to an IMAP keyword. IMAP flag
 // keywords must be RFC 3501 atoms — printable ASCII without ( ) { % * " \ ]
-// or spaces — so labels are sanitized: every disallowed rune becomes '_',
-// runs are collapsed and trimmed. The result is lowercased because IMAP
-// flags are case-insensitive and servers canonicalize them anyway (this also
-// matches Thunderbird's lowercase tag-key convention).
-// ("[Werbung]" -> "werbung", "Work/Projects" -> "work_projects",
-// "Bücher" -> "b_cher".)
-// Returns "" (skip) if nothing survives. Distinct labels may collide after
-// sanitization; documented and harmless.
-func keywordFor(label string) string {
+// or spaces — so labels are sanitized: every disallowed rune becomes the
+// replacement character (repl), runs are collapsed and trimmed. The result
+// is lowercased because IMAP flags are case-insensitive and servers
+// canonicalize them anyway.
+// With repl='-': "[Werbung]" -> "werbung", "Work/Projects" -> "work-projects",
+// "Bücher" -> "b-cher". Returns "" (skip) if nothing survives. Distinct
+// labels may collide after sanitization; documented and harmless.
+func keywordFor(label, repl string) string {
+	rc := byte('_')
+	if len(repl) > 0 {
+		rc = repl[0]
+	}
 	var b strings.Builder
-	lastUnderscore := false
+	lastRepl := false
 	for _, r := range label {
-		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-'
-		if ok {
-			b.WriteRune(r)
-			lastUnderscore = false
-		} else if !lastUnderscore {
-			b.WriteByte('_')
-			lastUnderscore = true
+		// Keep ASCII alphanumerics and both separators (- and _ are valid
+		// keyword atom chars); everything else becomes the replacement.
+		keep := r < 128 && (r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' || r == '-' || r == '_')
+		if keep {
+			b.WriteByte(byte(r))
+			lastRepl = false
+		} else if !lastRepl {
+			b.WriteByte(rc)
+			lastRepl = true
 		}
 	}
-	return strings.ToLower(strings.Trim(b.String(), "_"))
+	return strings.ToLower(strings.Trim(b.String(), string(rc)))
 }
 
 // labelKeyword maps one label to its destination keyword flag, applying the
 // configured prefix (e.g. "$label:" for Bulwark) outside sanitization. Returns
 // "" when the sanitized slug is empty.
 func (r *Reconciler) labelKeyword(label string) imap.Flag {
-	slug := keywordFor(label)
+	slug := keywordFor(label, r.opts.KeywordReplacement)
 	if slug == "" {
 		return ""
 	}

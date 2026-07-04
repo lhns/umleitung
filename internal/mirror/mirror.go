@@ -145,9 +145,10 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 		SentRouting:    m.Sent.Enabled,
 		SentSrcFolder:  sentSrcFolder,
 		SentFolder:     m.Sent.Folder,
-		LabelPropagate: m.Labels.Propagate,
-		KeywordPrefix:  m.Labels.KeywordPrefix,
-		OnProgress:     onProgress,
+		LabelPropagate:     m.Labels.Propagate,
+		KeywordPrefix:      m.Labels.KeywordPrefix,
+		KeywordReplacement: m.Labels.KeywordReplacement,
+		OnProgress:         onProgress,
 	}, log)
 
 	// Destination seeding: bootstrap the dedup set from what the destination

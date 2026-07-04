@@ -12,27 +12,32 @@ import (
 )
 
 func TestKeywordForSanitization(t *testing.T) {
-	cases := []struct{ label, want string }{
-		{"Work", "work"},
-		{"[Werbung]", "werbung"},          // brackets trimmed
-		{"Werbung", "werbung"},            // collides with the above — documented
-		{"Bücher", "b_cher"},              // umlaut
-		{"Wichtige Mails", "wichtige_mails"},
-		{"Work/Projects", "work_projects"}, // hierarchy delimiter
-		{"$Important", "important"},        // leading reserved char
-		{`\Seen`, "seen"},                 // leading backslash
-		{"a  b//c", "a_b_c"},               // runs collapsed
-		{"---", "---"},                     // dashes are atom-safe
-		{"...", ""},                        // nothing survives -> skip
-		{"", ""},
+	cases := []struct{ label, repl, want string }{
+		{"Work", "_", "work"},
+		{"[Werbung]", "_", "werbung"},          // brackets trimmed
+		{"Werbung", "_", "werbung"},            // collides with the above
+		{"Bücher", "_", "b_cher"},              // umlaut
+		{"Wichtige Mails", "_", "wichtige_mails"},
+		{"Work/Projects", "_", "work_projects"}, // hierarchy delimiter
+		{"$Important", "_", "important"},
+		{`\Seen`, "_", "seen"},
+		{"a  b//c", "_", "a_b_c"},               // runs collapsed
+		{"---", "_", "---"},                     // dashes kept literally
+		{"...", "_", ""},                        // nothing survives -> skip
+		{"", "_", ""},
+		// Dash replacement (Bulwark convention).
+		{"Wichtige Mails", "-", "wichtige-mails"},
+		{"Work/Projects", "-", "work-projects"},
+		{"Bücher", "-", "b-cher"},
+		{"a  b//c", "-", "a-b-c"},               // runs collapsed to one dash
+		{"Work_Sub", "-", "work_sub"},           // underscore kept literally
 	}
 	for _, c := range cases {
-		if got := keywordFor(c.label); got != c.want {
-			t.Errorf("keywordFor(%q) = %q, want %q", c.label, got, c.want)
+		if got := keywordFor(c.label, c.repl); got != c.want {
+			t.Errorf("keywordFor(%q, %q) = %q, want %q", c.label, c.repl, got, c.want)
 		}
 	}
-	// Collision case is intentional: both map to the same keyword.
-	if keywordFor("[Werbung]") != keywordFor("Werbung") {
+	if keywordFor("[Werbung]", "_") != keywordFor("Werbung", "_") {
 		t.Error("bracket collision case changed — update docs")
 	}
 }

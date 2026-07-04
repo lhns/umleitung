@@ -48,6 +48,10 @@ mirrors:
       #                             # Bulwark webmail client, which only shows
       #                             # labels from $label:<id> keywords. Default
       #                             # is bare (standard IMAP keyword; Thunderbird).
+      # keyword_replacement: "-"    # char that replaces spaces/slashes/etc. when
+      #                             # sanitizing a label ("Wichtige Mails" ->
+      #                             # "wichtige-mails"). Default "_"; Bulwark
+      #                             # uses "-". Single [A-Za-z0-9_-] char.
 
   # - name: otheruser        # any number of mirrors run concurrently
   #   source: { host: imap.gmail.com, user: other@gmail.com, password_file: /run/secrets/other_src, folder: '\All' }

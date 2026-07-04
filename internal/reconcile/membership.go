@@ -381,6 +381,7 @@ func (r *Reconciler) backfillFingerprint() string {
 		"sentdst=" + r.opts.SentFolder,
 		fmt.Sprintf("labels=%t", r.opts.SyncLabels),
 		"kwprefix=" + r.opts.KeywordPrefix,
+		"kwrepl=" + r.opts.KeywordReplacement,
 	}, ";")
 }
 

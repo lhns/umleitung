@@ -61,6 +61,9 @@ func TestMinimalConfigGetsAllDefaults(t *testing.T) {
 	if m.Labels.Enabled || m.Labels.Propagate || m.Labels.KeywordPrefix != "" {
 		t.Fatalf("labels defaults: %+v", m.Labels)
 	}
+	if m.Labels.KeywordReplacement != "_" {
+		t.Fatalf("keyword_replacement default = %q, want _", m.Labels.KeywordReplacement)
+	}
 	if m.Sent.Enabled || m.Sent.Folder != "Sent" || m.Sent.SourceFolder != `\Sent` {
 		t.Fatalf("sent defaults: %+v", m.Sent)
 	}
@@ -122,6 +125,7 @@ mirrors:
       propagate: true
       exclude: [Notes, Some/Other]
       keyword_prefix: "$label:"
+      keyword_replacement: "-"
   - name: other
     source: { host: imap.gmail.com, user: o@gmail.com, password: x, folder: '\All' }
     dest:   { host: mail.lhns.de, user: o@lhns.de, password: y }
@@ -147,6 +151,9 @@ mirrors:
 	}
 	if m.Labels.KeywordPrefix != "$label:" {
 		t.Fatalf("keyword_prefix = %q, want $label:", m.Labels.KeywordPrefix)
+	}
+	if m.Labels.KeywordReplacement != "-" {
+		t.Fatalf("keyword_replacement = %q, want -", m.Labels.KeywordReplacement)
 	}
 	if m.Dest.TLS {
 		t.Fatal("explicit tls: false ignored")
@@ -187,6 +194,8 @@ mirrors:
     dest:   { host: h, user: u, password: p }
 `, "not both"},
 		{"propagate without enabled", minimal + "    labels: { propagate: true }\n", "labels.propagate requires"},
+		{"bad keyword_replacement (multichar)", minimal + "    labels: { keyword_replacement: \"--\" }\n", "single keyword char"},
+		{"bad keyword_replacement (space)", minimal + "    labels: { keyword_replacement: \" \" }\n", "single keyword char"},
 		{"archive folder clash", minimal + "    archive: { enabled: true, folder: INBOX }\n", "must differ from dest.folder"},
 		{"sent folder clash dest", minimal + "    sent: { enabled: true, folder: INBOX }\n", "sent.folder must differ from dest.folder"},
 		{"sent folder clash archive", minimal + "    archive: { enabled: true }\n    sent: { enabled: true, folder: Archive }\n", "sent.folder must differ from archive.folder"},

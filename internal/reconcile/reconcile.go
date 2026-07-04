@@ -93,8 +93,9 @@ type Options struct {
 	SentRouting    bool   // route by source-Sent membership; propagate moves
 	SentSrcFolder  string // resolved source folder whose membership means "sent"
 	SentFolder     string // destination folder for sent mail
-	LabelPropagate bool   // STORE keyword changes for post-copy label changes
-	KeywordPrefix  string // prepended to each label keyword (e.g. "$label:")
+	LabelPropagate     bool   // STORE keyword changes for post-copy label changes
+	KeywordPrefix      string // prepended to each label keyword (e.g. "$label:")
+	KeywordReplacement string // sanitization replacement char (default "_")
 
 	// OnProgress, if set, is called after every committed work window in any
 	// long-running phase (seeding, membership scan, mirror, backfill). Used

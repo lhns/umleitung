@@ -83,10 +83,11 @@ type Sent struct {
 
 // Labels groups the label-sync settings.
 type Labels struct {
-	Enabled       bool
-	Propagate     bool
-	Exclude       []string
-	KeywordPrefix string // prepended to each keyword (e.g. "$label:" for Bulwark)
+	Enabled            bool
+	Propagate          bool
+	Exclude            []string
+	KeywordPrefix      string // prepended to each keyword (e.g. "$label:" for Bulwark)
+	KeywordReplacement string // sanitization replacement char (default "_"; "-" for Bulwark)
 }
 
 // ---- raw yaml schema (pointers/wrappers to distinguish absent from set) ----
@@ -169,10 +170,11 @@ type rawSent struct {
 }
 
 type rawLabels struct {
-	Enabled       bool     `yaml:"enabled"`
-	Propagate     bool     `yaml:"propagate"`
-	Exclude       []string `yaml:"exclude"`
-	KeywordPrefix string   `yaml:"keyword_prefix"`
+	Enabled            bool     `yaml:"enabled"`
+	Propagate          bool     `yaml:"propagate"`
+	Exclude            []string `yaml:"exclude"`
+	KeywordPrefix      string   `yaml:"keyword_prefix"`
+	KeywordReplacement string   `yaml:"keyword_replacement"`
 }
 
 // ---- loading ----
@@ -186,6 +188,10 @@ func Path() string {
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9_-]+$`)
+
+func isKeywordChar(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '_'
+}
 
 // LoadFile reads, defaults and validates the YAML configuration. Unknown
 // keys are rejected (typo protection).
@@ -246,10 +252,11 @@ func resolve(raw *rawConfig) (*Config, error) {
 				SourceFolder: defaultStr(rm.Sent.SourceFolder, `\Sent`),
 			},
 			Labels: Labels{
-				Enabled:       rm.Labels.Enabled,
-				Propagate:     rm.Labels.Propagate,
-				Exclude:       rm.Labels.Exclude,
-				KeywordPrefix: rm.Labels.KeywordPrefix,
+				Enabled:            rm.Labels.Enabled,
+				Propagate:          rm.Labels.Propagate,
+				Exclude:            rm.Labels.Exclude,
+				KeywordPrefix:      rm.Labels.KeywordPrefix,
+				KeywordReplacement: defaultStr(rm.Labels.KeywordReplacement, "_"),
 			},
 		}
 
@@ -285,6 +292,9 @@ func resolve(raw *rawConfig) (*Config, error) {
 		}
 		if m.Labels.Propagate && !m.Labels.Enabled {
 			fail("%s: labels.propagate requires labels.enabled", where)
+		}
+		if r := m.Labels.KeywordReplacement; len([]rune(r)) != 1 || !isKeywordChar(r[0]) {
+			fail("%s: labels.keyword_replacement must be a single keyword char [A-Za-z0-9_-], got %q", where, r)
 		}
 		if m.Archive.Enabled && m.Archive.Folder == m.Dest.Folder {
 			fail("%s: archive.folder must differ from dest.folder", where)

@@ -93,6 +93,7 @@ on-by-default feature off, set it explicitly: `health_addr: null`.
 | `labels.propagate` | `false` | Post-copy label changes as keyword deltas (requires `labels.enabled`) |
 | `labels.exclude` | `[]` | Folder names excluded from the label scan |
 | `labels.keyword_prefix` | `""` | Prepended to each keyword. Set `"$label:"` for the Bulwark webmail client (see below); default bare keyword for other clients |
+| `labels.keyword_replacement` | `"_"` | Single `[A-Za-z0-9_-]` char that replaces spaces/slashes/non-ASCII when sanitizing a label into a keyword. Bulwark slugifies with `"-"` |
 
 Tip: pick a dedicated destination folder (e.g. `Mirror`) rather than `INBOX`
 or `Archive` when you don't use archive routing — mirrored mail stays clearly
@@ -129,8 +130,10 @@ keywords** on the destination.
   clients ignore them (they stay on the server).
 - **Keyword names are sanitized:** IMAP flags must be ASCII atoms, so labels
   are mapped like `[Werbung]` → `werbung`, `Work/Projects` → `work_projects`,
-  `Bücher` → `b_cher` (lowercased — IMAP flags are case-insensitive).
-  Distinct labels can collide after sanitization; harmless.
+  `Bücher` → `b_cher` (lowercased — IMAP flags are case-insensitive). The
+  separator char is configurable via `labels.keyword_replacement` (default
+  `_`; Bulwark uses `-`, giving `work-projects`). Distinct labels can collide
+  after sanitization; harmless.
 - **Post-copy changes propagate with `labels.propagate: true`:** labels
   added/removed in the source after a message was mirrored are applied to the
   destination copy as **deltas** (`STORE ±FLAGS` of just the changed keyword,
