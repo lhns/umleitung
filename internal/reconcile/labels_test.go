@@ -38,10 +38,18 @@ func TestKeywordForSanitization(t *testing.T) {
 }
 
 func TestKeywordFlagsDedupAndSkip(t *testing.T) {
-	flags := keywordFlags([]string{"[Werbung]", "Werbung", "...", "Work"})
+	rec := &Reconciler{} // no prefix
+	flags := rec.labelKeywords([]string{"[Werbung]", "Werbung", "...", "Work"})
 	want := []imap.Flag{"werbung", "work"}
 	if !slices.Equal(flags, want) {
-		t.Fatalf("keywordFlags = %v, want %v", flags, want)
+		t.Fatalf("labelKeywords = %v, want %v", flags, want)
+	}
+
+	// With a prefix (Bulwark): $label:<slug>, still deduped.
+	rec = &Reconciler{opts: Options{KeywordPrefix: "$label:"}}
+	pref := rec.labelKeywords([]string{"Work", "work", "..."})
+	if !slices.Equal(pref, []imap.Flag{"$label:work"}) {
+		t.Fatalf("prefixed = %v, want [$label:work]", pref)
 	}
 }
 

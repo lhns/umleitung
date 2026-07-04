@@ -44,6 +44,10 @@ mirrors:
       enabled: true
       propagate: true        # apply post-copy label changes as keyword deltas
       # exclude: [Notes]
+      # keyword_prefix: "$label:"   # prepend to each keyword. REQUIRED for the
+      #                             # Bulwark webmail client, which only shows
+      #                             # labels from $label:<id> keywords. Default
+      #                             # is bare (standard IMAP keyword; Thunderbird).
 
   # - name: otheruser        # any number of mirrors run concurrently
   #   source: { host: imap.gmail.com, user: other@gmail.com, password_file: /run/secrets/other_src, folder: '\All' }

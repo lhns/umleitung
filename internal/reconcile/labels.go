@@ -69,18 +69,29 @@ func keywordFor(label string) string {
 	return strings.ToLower(strings.Trim(b.String(), "_"))
 }
 
-// keywordFlags converts recorded labels to IMAP keyword flags (deduplicated,
+// labelKeyword maps one label to its destination keyword flag, applying the
+// configured prefix (e.g. "$label:" for Bulwark) outside sanitization. Returns
+// "" when the sanitized slug is empty.
+func (r *Reconciler) labelKeyword(label string) imap.Flag {
+	slug := keywordFor(label)
+	if slug == "" {
+		return ""
+	}
+	return imap.Flag(r.opts.KeywordPrefix + slug)
+}
+
+// labelKeywords converts recorded labels to keyword flags (deduplicated,
 // empty results skipped).
-func keywordFlags(labels []string) []imap.Flag {
+func (r *Reconciler) labelKeywords(labels []string) []imap.Flag {
 	var flags []imap.Flag
-	seen := map[string]bool{}
+	seen := map[imap.Flag]bool{}
 	for _, l := range labels {
-		kw := keywordFor(l)
+		kw := r.labelKeyword(l)
 		if kw == "" || seen[kw] {
 			continue
 		}
 		seen[kw] = true
-		flags = append(flags, imap.Flag(kw))
+		flags = append(flags, kw)
 	}
 	return flags
 }

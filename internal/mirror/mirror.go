@@ -146,6 +146,7 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 		SentSrcFolder:  sentSrcFolder,
 		SentFolder:     m.Sent.Folder,
 		LabelPropagate: m.Labels.Propagate,
+		KeywordPrefix:  m.Labels.KeywordPrefix,
 		OnProgress:     onProgress,
 	}, log)
 
@@ -234,7 +235,8 @@ func runReconcile(ctx context.Context, rec *reconcile.Reconciler, log *slog.Logg
 	log.Info("reconcile done",
 		"candidates", sum.Candidates, "copied", sum.Copied, "skipped_dupes", sum.SkippedDup,
 		"moved_to_archive", sum.MovedToArchive, "moved_to_inbox", sum.MovedToInbox,
-		"moved_to_sent", sum.MovedToSent, "keywords_updated", sum.KeywordsUpdated,
+		"moved_to_sent", sum.MovedToSent,
+		"keywords_set", sum.KeywordsSet, "keywords_updated", sum.KeywordsUpdated,
 		"uidvalidity_changed", sum.UIDValidityChanged,
 		"took", time.Since(start).Round(time.Millisecond))
 	return nil

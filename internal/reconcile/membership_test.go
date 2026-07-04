@@ -233,6 +233,96 @@ func TestLabelPropagation(t *testing.T) {
 	}
 }
 
+// With a keyword prefix (Bulwark), copy-time labels, propagation, and the
+// backfill-driven re-tag of already-mirrored mail all use $label:<slug>.
+func TestKeywordPrefixEndToEnd(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1"), msg(2, "<m2@x>", "raw-2")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<m1@x>", "raw-1")}},
+		},
+	}
+	dst := newFakeDest()
+	opts := Options{SyncLabels: true, LabelPropagate: true, SourceFolder: fakeMainFolder, KeywordPrefix: "$label:"}
+	rec := newRec(store, src, dst, opts)
+
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Copy-time: m1 labeled Work -> $label:work; counted in KeywordsSet.
+	if sum.KeywordsSet != 1 {
+		t.Fatalf("keywords_set = %d, want 1", sum.KeywordsSet)
+	}
+	m1 := findDstMsg(dst, "<m1@x>")
+	if !slices.Contains(m1.flags, imap.Flag("$label:work")) {
+		t.Fatalf("copy-time keyword = %v, want $label:work", m1.flags)
+	}
+	if bare := findDstMsg(dst, "<m1@x>"); slices.Contains(bare.flags, imap.Flag("work")) {
+		t.Fatalf("bare keyword leaked: %v", bare.flags)
+	}
+
+	// Propagation: add label to m2 after copy -> $label:work via STORE.
+	src.labelFolders["Work"].msgs = append(src.labelFolders["Work"].msgs, msg(2, "<m2@x>", "raw-2"))
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m2 := findDstMsg(dst, "<m2@x>"); !slices.Contains(m2.flags, imap.Flag("$label:work")) {
+		t.Fatalf("propagated keyword = %v, want $label:work", m2.flags)
+	}
+}
+
+// Switching the keyword prefix on an existing mirror re-tags already-mirrored
+// mail via the backfill (fingerprint change), add-only (old keyword kept).
+func TestKeywordPrefixBackfillRetagsExisting(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{
+		uidValidity: 7,
+		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1")},
+		labelFolders: map[string]*fakeLabelFolder{
+			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<m1@x>", "raw-1")}},
+		},
+	}
+	dst := newFakeDest()
+
+	// Phase 1: bare keyword.
+	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m := findDstMsg(dst, "<m1@x>"); !slices.Contains(m.flags, imap.Flag("work")) {
+		t.Fatalf("phase 1 keyword = %v, want work", m.flags)
+	}
+
+	// Phase 2: add prefix -> fingerprint changes -> backfill adds $label:work.
+	rec = newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder, KeywordPrefix: "$label:"})
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.KeywordsUpdated != 1 {
+		t.Fatalf("backfill keywords_updated = %d, want 1", sum.KeywordsUpdated)
+	}
+	m := findDstMsg(dst, "<m1@x>")
+	if !slices.Contains(m.flags, imap.Flag("$label:work")) {
+		t.Fatalf("post-backfill keyword missing: %v", m.flags)
+	}
+	if !slices.Contains(m.flags, imap.Flag("work")) {
+		t.Fatalf("add-only violated, old keyword removed: %v", m.flags)
+	}
+
+	// Phase 3: same config -> no more backfill work.
+	sum, err = rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.KeywordsUpdated != 0 {
+		t.Fatalf("backfill re-ran: keywords_updated = %d", sum.KeywordsUpdated)
+	}
+}
+
 func TestLabelPropagationDisabledMeansNoStores(t *testing.T) {
 	store := newFakeStore()
 	src := &fakeSource{

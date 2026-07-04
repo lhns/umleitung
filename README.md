@@ -92,6 +92,7 @@ on-by-default feature off, set it explicitly: `health_addr: null`.
 | `labels.enabled` | `false` | See Label sync below |
 | `labels.propagate` | `false` | Post-copy label changes as keyword deltas (requires `labels.enabled`) |
 | `labels.exclude` | `[]` | Folder names excluded from the label scan |
+| `labels.keyword_prefix` | `""` | Prepended to each keyword. Set `"$label:"` for the Bulwark webmail client (see below); default bare keyword for other clients |
 
 Tip: pick a dedicated destination folder (e.g. `Mirror`) rather than `INBOX`
 or `Archive` when you don't use archive routing — mirrored mail stays clearly
@@ -144,6 +145,18 @@ keywords** on the destination.
   store exposed via both protocols. Unlike Gmail labels they are flat strings
   (no colors/hierarchy; that's client-side), don't act as folder views, and
   are searchable (`SEARCH KEYWORD` / JMAP `hasKeyword`).
+- **Client keyword conventions — `keyword_prefix`:** a keyword only shows as
+  a "label" if the client recognizes it. The default (bare keyword, e.g.
+  `github`) works with clients like Thunderbird once you define a matching
+  tag. The **[Bulwark](https://github.com/bulwarkmail/webmail) webmail client
+  only surfaces labels from keywords in its `$label:` namespace** — set
+  `labels.keyword_prefix: "$label:"` and a Gmail label `GitHub` becomes the
+  keyword `$label:github`, which Bulwark shows as a pill on the message
+  (unknown ones render gray; define a label with id `github` in Bulwark
+  settings to give it a name/color, and to make it appear in the sidebar
+  labels list). Changing this prefix on an existing mirror re-tags all
+  already-mirrored mail automatically (the backfill runs on the next start,
+  add-only — the previous bare keyword stays but is inert).
 - Excluded automatically: the source folder, `INBOX`, and special-use folders
   (Sent, Trash, Junk, All Mail, Starred, Important, Drafts, Archive). Add
   more via `labels.exclude: [Notes, Some/Other]`.

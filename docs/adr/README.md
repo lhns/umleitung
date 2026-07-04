@@ -19,3 +19,4 @@ settled. Format: [Michael Nygard's ADR template](https://cognitect.com/blog/2011
 | [0011](0011-membership-propagation-archive-and-labels.md) | Membership propagation: archive routing/moves + label keyword updates; DB migrations |
 | [0012](0012-yaml-config-multi-mirror.md) | YAML configuration and multi-mirror instances |
 | [0013](0013-sent-routing.md) | Sent routing: a third destination bucket |
+| [0014](0014-configurable-keyword-prefix.md) | Configurable label-keyword prefix (client namespaces) |

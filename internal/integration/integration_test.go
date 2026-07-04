@@ -356,12 +356,13 @@ func TestLabelSyncEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := reconcile.New(store, src, dst, reconcile.Options{
-		DestFolder: dstEP.Folder,
-		UIDBatch:     2,
-		DestGuard:    true,
-		SyncLabels:   true,
-		SourceFolder: srcFolder,
-		LabelExclude: []string{"Ignored"},
+		DestFolder:    dstEP.Folder,
+		UIDBatch:      2,
+		DestGuard:     true,
+		SyncLabels:    true,
+		SourceFolder:  srcFolder,
+		LabelExclude:  []string{"Ignored"},
+		KeywordPrefix: "$label:", // Bulwark namespace, exercised end-to-end
 	}, slog.New(slog.DiscardHandler))
 
 	ctx := context.Background()
@@ -407,10 +408,10 @@ func TestLabelSyncEndToEnd(t *testing.T) {
 	}
 
 	got := keywordsByMID()
-	if want := []string{"friends_close", "work"}; !slices.Equal(got["<m1@test>"], want) {
+	if want := []string{"$label:friends_close", "$label:work"}; !slices.Equal(got["<m1@test>"], want) {
 		t.Fatalf("m1 keywords = %v, want %v (Ignored folder must not contribute)", got["<m1@test>"], want)
 	}
-	if want := []string{"work"}; !slices.Equal(got["<m2@test>"], want) {
+	if want := []string{"$label:work"}; !slices.Equal(got["<m2@test>"], want) {
 		t.Fatalf("m2 keywords = %v, want %v", got["<m2@test>"], want)
 	}
 	if len(got["<m3@test>"]) != 0 {
@@ -438,7 +439,7 @@ func TestLabelSyncEndToEnd(t *testing.T) {
 		t.Fatalf("incremental copied %d, want 1", sum.Copied)
 	}
 	got = keywordsByMID()
-	if want := []string{"work"}; !slices.Equal(got["<m4@test>"], want) {
+	if want := []string{"$label:work"}; !slices.Equal(got["<m4@test>"], want) {
 		t.Fatalf("m4 keywords = %v, want %v", got["<m4@test>"], want)
 	}
 }

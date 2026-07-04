@@ -83,9 +83,10 @@ type Sent struct {
 
 // Labels groups the label-sync settings.
 type Labels struct {
-	Enabled   bool
-	Propagate bool
-	Exclude   []string
+	Enabled       bool
+	Propagate     bool
+	Exclude       []string
+	KeywordPrefix string // prepended to each keyword (e.g. "$label:" for Bulwark)
 }
 
 // ---- raw yaml schema (pointers/wrappers to distinguish absent from set) ----
@@ -168,9 +169,10 @@ type rawSent struct {
 }
 
 type rawLabels struct {
-	Enabled   bool     `yaml:"enabled"`
-	Propagate bool     `yaml:"propagate"`
-	Exclude   []string `yaml:"exclude"`
+	Enabled       bool     `yaml:"enabled"`
+	Propagate     bool     `yaml:"propagate"`
+	Exclude       []string `yaml:"exclude"`
+	KeywordPrefix string   `yaml:"keyword_prefix"`
 }
 
 // ---- loading ----
@@ -244,9 +246,10 @@ func resolve(raw *rawConfig) (*Config, error) {
 				SourceFolder: defaultStr(rm.Sent.SourceFolder, `\Sent`),
 			},
 			Labels: Labels{
-				Enabled:   rm.Labels.Enabled,
-				Propagate: rm.Labels.Propagate,
-				Exclude:   rm.Labels.Exclude,
+				Enabled:       rm.Labels.Enabled,
+				Propagate:     rm.Labels.Propagate,
+				Exclude:       rm.Labels.Exclude,
+				KeywordPrefix: rm.Labels.KeywordPrefix,
 			},
 		}
 

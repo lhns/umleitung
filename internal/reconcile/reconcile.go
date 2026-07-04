@@ -94,6 +94,7 @@ type Options struct {
 	SentSrcFolder  string // resolved source folder whose membership means "sent"
 	SentFolder     string // destination folder for sent mail
 	LabelPropagate bool   // STORE keyword changes for post-copy label changes
+	KeywordPrefix  string // prepended to each label keyword (e.g. "$label:")
 
 	// OnProgress, if set, is called after every committed work window in any
 	// long-running phase (seeding, membership scan, mirror, backfill). Used
@@ -126,7 +127,8 @@ type Summary struct {
 	MovedToArchive     int
 	MovedToInbox       int
 	MovedToSent        int
-	KeywordsUpdated    int
+	KeywordsSet        int // copy-time keyword applications (labels on new mail)
+	KeywordsUpdated    int // post-copy keyword STOREs (propagation + backfill)
 }
 
 // Reconciler mirrors new source messages into the destination.
@@ -194,6 +196,16 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 		}
 	}
 
+	// Placement/keyword backfill: auto-corrects mail mirrored before the
+	// current routing/label config was active (config fingerprint change).
+	// Runs BEFORE the mirror loop so a config change (e.g. new keyword prefix)
+	// re-tags already-mirrored mail promptly, not only after a days-long first
+	// run finishes. Touches only the destination connection; the source stays
+	// selected for the loop below.
+	if err := r.maybeBackfill(ctx, sum); err != nil {
+		return sum, fmt.Errorf("backfill: %w", err)
+	}
+
 	// Windowed, resumable scan: [lastUID+1 .. uidNext-1] in UIDBatch windows.
 	// last_uid is committed once per window, so a crash or a provider-throttle
 	// disconnect resumes from the last committed window.
@@ -218,12 +230,6 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 			return sum, err
 		}
 		r.opts.progress("mirror", "", sum.Copied)
-	}
-
-	// Placement/keyword backfill: auto-corrects mail mirrored before the
-	// current routing/label config was active (config fingerprint change).
-	if err := r.maybeBackfill(ctx, sum); err != nil {
-		return sum, fmt.Errorf("backfill: %w", err)
 	}
 
 	// Apply queued destination mutations (routing moves, keyword updates).
@@ -398,6 +404,7 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 		settleOldest := func() {
 			it := ring[0]
 			ring = ring[1:]
+			keywordsLanded := it.hadKeywords
 			if err := it.pa.Wait(); err != nil {
 				// The keyword-less retry is only safe when the SERVER
 				// rejected the append (tagged NO/BAD = definitely not
@@ -416,6 +423,10 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 					fail(fmt.Errorf("uid %d: %w", it.pc.uid, err))
 					return
 				}
+				keywordsLanded = false // fallback stripped them
+			}
+			if keywordsLanded {
+				sum.KeywordsSet++
 			}
 			records = append(records, state.KeyRecord{
 				Key: it.pc.key, UID: uint32(it.pc.uid), CopiedAtUnix: r.now().Unix(),
@@ -442,7 +453,7 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 					fail(err)
 					continue
 				}
-				keywords = keywordFlags(labels)
+				keywords = r.labelKeywords(labels)
 				flags = append(append([]imap.Flag{}, baseFlags...), keywords...)
 			}
 			pa, err := r.dst.BeginAppend(it.pc.destFolder, it.full, flags)

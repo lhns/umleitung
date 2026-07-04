@@ -58,7 +58,7 @@ func TestMinimalConfigGetsAllDefaults(t *testing.T) {
 	if m.Archive.Enabled || m.Archive.Folder != "Archive" {
 		t.Fatalf("archive defaults: %+v", m.Archive)
 	}
-	if m.Labels.Enabled || m.Labels.Propagate {
+	if m.Labels.Enabled || m.Labels.Propagate || m.Labels.KeywordPrefix != "" {
 		t.Fatalf("labels defaults: %+v", m.Labels)
 	}
 	if m.Sent.Enabled || m.Sent.Folder != "Sent" || m.Sent.SourceFolder != `\Sent` {
@@ -121,6 +121,7 @@ mirrors:
       enabled: true
       propagate: true
       exclude: [Notes, Some/Other]
+      keyword_prefix: "$label:"
   - name: other
     source: { host: imap.gmail.com, user: o@gmail.com, password: x, folder: '\All' }
     dest:   { host: mail.lhns.de, user: o@lhns.de, password: y }
@@ -143,6 +144,9 @@ mirrors:
 	}
 	if !m.Labels.Propagate || len(m.Labels.Exclude) != 2 {
 		t.Fatalf("labels: %+v", m.Labels)
+	}
+	if m.Labels.KeywordPrefix != "$label:" {
+		t.Fatalf("keyword_prefix = %q, want $label:", m.Labels.KeywordPrefix)
 	}
 	if m.Dest.TLS {
 		t.Fatal("explicit tls: false ignored")

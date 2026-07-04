@@ -321,6 +321,19 @@ func (d *fakeDest) total() int {
 
 func (d *fakeDest) inFolder(folder string) []*destMsg { return d.folders[folder] }
 
+// findDstMsg returns the destination message with the given Message-ID from
+// whichever folder holds it (test helper).
+func findDstMsg(d *fakeDest, mid string) *destMsg {
+	for _, msgs := range d.folders {
+		for _, m := range msgs {
+			if m.mid == mid {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
 func (d *fakeDest) SelectNamedFolder(name string) (uint32, uint32, uint32, error) {
 	d.selected = name
 	return 1, d.nextUID[name] + 1, uint32(len(d.folders[name])), nil

@@ -349,12 +349,12 @@ func (r *Reconciler) applyPending(op PendingOp, sum *Summary) error {
 		if !r.opts.LabelPropagate {
 			return nil
 		}
-		kw := keywordFor(op.Folder)
+		kw := r.labelKeyword(op.Folder)
 		if kw == "" {
 			return nil
 		}
 		for _, folder := range r.destBucketFolders() {
-			found, err := r.dst.StoreKeywordByMessageID(folder, op.MessageID, op.Op == "add", imap.Flag(kw))
+			found, err := r.dst.StoreKeywordByMessageID(folder, op.MessageID, op.Op == "add", kw)
 			if err != nil {
 				return err
 			}
@@ -380,6 +380,7 @@ func (r *Reconciler) backfillFingerprint() string {
 		"sentsrc=" + r.opts.SentSrcFolder,
 		"sentdst=" + r.opts.SentFolder,
 		fmt.Sprintf("labels=%t", r.opts.SyncLabels),
+		"kwprefix=" + r.opts.KeywordPrefix,
 	}, ";")
 }
 
@@ -453,7 +454,7 @@ func (r *Reconciler) backfillDestFolder(ctx context.Context, folder string, sum 
 				if err != nil {
 					return err
 				}
-				missing := missingKeywords(labels, metas[i].Flags)
+				missing := r.missingKeywords(labels, metas[i].Flags)
 				if len(missing) > 0 {
 					sig := flagSig(missing)
 					kwGroups[sig] = append(kwGroups[sig], metas[i].UID)
@@ -491,15 +492,17 @@ func (r *Reconciler) backfillDestFolder(ctx context.Context, folder string, sum 
 	return nil
 }
 
-// missingKeywords returns keyword flags for labels not yet present in flags.
-func missingKeywords(labels []string, flags []imap.Flag) []imap.Flag {
+// missingKeywords returns keyword flags for labels not yet present in flags
+// (add-only: never removes existing keywords, e.g. an old bare keyword left
+// over after switching the keyword prefix).
+func (r *Reconciler) missingKeywords(labels []string, flags []imap.Flag) []imap.Flag {
 	present := map[string]bool{}
 	for _, f := range flags {
 		present[strings.ToLower(string(f))] = true
 	}
 	var missing []imap.Flag
-	for _, kw := range keywordFlags(labels) {
-		if !present[string(kw)] {
+	for _, kw := range r.labelKeywords(labels) {
+		if !present[strings.ToLower(string(kw))] {
 			missing = append(missing, kw)
 		}
 	}
