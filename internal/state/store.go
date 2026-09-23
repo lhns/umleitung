@@ -6,24 +6,32 @@ package state
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 
 	_ "modernc.org/sqlite"
 )
 
-// Store is the persistent sync state. Safe for a single process (Umleiter
-// enforces single-process via a file lock); SQLite serializes writers anyway.
+const (
+	insertCopied = `INSERT INTO copied (message_id, uid, copied_at) VALUES (?, ?, ?)
+		ON CONFLICT(message_id) DO NOTHING`
+	upsertMember = `INSERT INTO members (folder, message_id, uid) VALUES (?, ?, ?)
+		ON CONFLICT(folder, message_id) DO UPDATE SET uid = excluded.uid`
+	deleteMember  = `DELETE FROM members WHERE folder = ? AND message_id = ?`
+	insertPending = `INSERT INTO pending (kind, message_id, folder, op) VALUES (?, ?, ?, ?)`
+	deletePending = `DELETE FROM pending WHERE id = ?`
+)
+
+// Store is the persistent sync state. Single-process only (enforced by the
+// file lock, see package lock).
 type Store struct {
 	db *sql.DB
 }
 
 // Open opens (or creates) the state database at path and migrates it to the
-// current schema version (see migrate.go). Databases created by older
-// versions — including ones from before the migration system existed — are
-// upgraded automatically and losslessly.
+// current schema version (see migrate.go).
 func Open(path string) (*Store, error) {
-	// WAL for durable, non-blocking commits; busy_timeout as a safety net.
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -41,23 +49,83 @@ func Open(path string) (*Store, error) {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) metaGet(key string) (string, error) {
+// inTx runs fn in a transaction, committing only if fn succeeds.
+func (s *Store) inTx(fn func(*sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// execBatch executes query n times (with args(i)) in one transaction.
+func (s *Store) execBatch(query string, n int, args func(i int) []any) error {
+	if n == 0 {
+		return nil
+	}
+	return s.inTx(func(tx *sql.Tx) error {
+		stmt, err := tx.Prepare(query)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		for i := range n {
+			if _, err := stmt.Exec(args(i)...); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// exists reports whether query returns at least one row.
+func (s *Store) exists(query string, args ...any) (bool, error) {
+	var one int
+	err := s.db.QueryRow(query, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// queryEach calls scan for every row of query.
+func (s *Store) queryEach(query string, scan func(*sql.Rows) error, args ...any) error {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// MetaGet returns a meta value ("" if unset).
+func (s *Store) MetaGet(key string) (string, error) {
 	var v string
 	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	return v, err
 }
 
-func (s *Store) metaSet(key, value string) error {
+// MetaSet stores a meta value.
+func (s *Store) MetaSet(key, value string) error {
 	_, err := s.db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
 }
 
 func (s *Store) metaGetUint(key string) (uint32, error) {
-	v, err := s.metaGet(key)
+	v, err := s.MetaGet(key)
 	if err != nil || v == "" {
 		return 0, err
 	}
@@ -68,147 +136,31 @@ func (s *Store) metaGetUint(key string) (uint32, error) {
 	return uint32(n), nil
 }
 
+func (s *Store) metaSetUint(key string, v uint32) error {
+	return s.MetaSet(key, strconv.FormatUint(uint64(v), 10))
+}
+
 // UIDValidity returns the last-seen source UIDVALIDITY (0 = never seen).
 func (s *Store) UIDValidity() (uint32, error) { return s.metaGetUint("uidvalidity") }
 
 // SetUIDValidity stores the source UIDVALIDITY.
-func (s *Store) SetUIDValidity(v uint32) error {
-	return s.metaSet("uidvalidity", strconv.FormatUint(uint64(v), 10))
-}
+func (s *Store) SetUIDValidity(v uint32) error { return s.metaSetUint("uidvalidity", v) }
 
 // LastUID returns the high-water mark within the current UIDVALIDITY.
 func (s *Store) LastUID() (uint32, error) { return s.metaGetUint("last_uid") }
 
 // SetLastUID stores the high-water mark.
-func (s *Store) SetLastUID(uid uint32) error {
-	return s.metaSet("last_uid", strconv.FormatUint(uint64(uid), 10))
-}
+func (s *Store) SetLastUID(uid uint32) error { return s.metaSetUint("last_uid", uid) }
 
-// HasKey reports whether a dedup key has already been recorded (indexed lookup).
+// HasKey reports whether a dedup key has been recorded.
 func (s *Store) HasKey(key string) (bool, error) {
-	var one int
-	err := s.db.QueryRow(`SELECT 1 FROM copied WHERE message_id = ?`, key).Scan(&one)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	return err == nil, err
+	return s.exists(`SELECT 1 FROM copied WHERE message_id = ?`, key)
 }
 
-// RecordKey records a dedup key after a confirmed successful append.
-// Idempotent: re-recording an existing key is a no-op.
+// RecordKey records a dedup key after a confirmed append. Idempotent.
 func (s *Store) RecordKey(key string, uid uint32, copiedAtUnix int64) error {
-	_, err := s.db.Exec(`INSERT INTO copied (message_id, uid, copied_at) VALUES (?, ?, ?)
-		ON CONFLICT(message_id) DO NOTHING`, key, uid, copiedAtUnix)
+	_, err := s.db.Exec(insertCopied, key, uid, copiedAtUnix)
 	return err
-}
-
-// CopiedCount returns the number of recorded dedup keys.
-func (s *Store) CopiedCount() (int64, error) {
-	var n int64
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM copied`).Scan(&n)
-	return n, err
-}
-
-// PendingOp is a queued destination mutation (move or keyword change) that
-// must be applied exactly-once-or-retried: enqueued in the same transaction
-// as the membership change that caused it, deleted only after the
-// STORE/MOVE is confirmed (or definitively unnecessary).
-type PendingOp struct {
-	ID        int64
-	Kind      string // "move" | "keyword"
-	MessageID string // dedup key
-	Folder    string // the membership folder that changed
-	Op        string // "add" | "remove"
-}
-
-// MemberChange atomically updates folder membership and — when pendingKind
-// is "move" or "keyword" — enqueues the pending destination operation caused
-// by it, in ONE transaction: a delta is either fully recorded or not at all.
-func (s *Store) MemberChange(folder, key string, uid uint32, add bool, pendingKind string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if add {
-		_, err = tx.Exec(`INSERT INTO members (folder, message_id, uid) VALUES (?, ?, ?)
-			ON CONFLICT(folder, message_id) DO UPDATE SET uid = excluded.uid`, folder, key, uid)
-	} else {
-		_, err = tx.Exec(`DELETE FROM members WHERE folder = ? AND message_id = ?`, folder, key)
-	}
-	if err != nil {
-		return err
-	}
-	if pendingKind != "" {
-		op := "remove"
-		if add {
-			op = "add"
-		}
-		if _, err := tx.Exec(`INSERT INTO pending (kind, message_id, folder, op) VALUES (?, ?, ?, ?)`,
-			pendingKind, key, folder, op); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
-// MemberChangeItem is one membership change for MemberChangeBatch.
-type MemberChangeItem struct {
-	Key         string
-	UID         uint32
-	Add         bool
-	PendingKind string // "" = no pending op
-}
-
-// MemberChangeBatch applies a window's worth of membership changes and their
-// pending ops in ONE transaction — same atomicity guarantee as per-item
-// MemberChange, coarser grain (thousands of fsync round trips fewer on slow
-// state volumes).
-func (s *Store) MemberChangeBatch(folder string, items []MemberChangeItem) error {
-	if len(items) == 0 {
-		return nil
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	add, err := tx.Prepare(`INSERT INTO members (folder, message_id, uid) VALUES (?, ?, ?)
-		ON CONFLICT(folder, message_id) DO UPDATE SET uid = excluded.uid`)
-	if err != nil {
-		return err
-	}
-	defer add.Close()
-	del, err := tx.Prepare(`DELETE FROM members WHERE folder = ? AND message_id = ?`)
-	if err != nil {
-		return err
-	}
-	defer del.Close()
-	pend, err := tx.Prepare(`INSERT INTO pending (kind, message_id, folder, op) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		return err
-	}
-	defer pend.Close()
-	for _, it := range items {
-		if it.Add {
-			_, err = add.Exec(folder, it.Key, it.UID)
-		} else {
-			_, err = del.Exec(folder, it.Key)
-		}
-		if err != nil {
-			return err
-		}
-		if it.PendingKind != "" {
-			op := "remove"
-			if it.Add {
-				op = "add"
-			}
-			if _, err := pend.Exec(it.PendingKind, it.Key, folder, op); err != nil {
-				return err
-			}
-		}
-	}
-	return tx.Commit()
 }
 
 // KeyRecord is one copied-message record for RecordKeys.
@@ -219,159 +171,179 @@ type KeyRecord struct {
 }
 
 // RecordKeys records a batch of dedup keys in one transaction. Idempotent
-// per key, like RecordKey.
+// per key.
 func (s *Store) RecordKeys(records []KeyRecord) error {
-	if len(records) == 0 {
-		return nil
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT INTO copied (message_id, uid, copied_at) VALUES (?, ?, ?)
-		ON CONFLICT(message_id) DO NOTHING`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	for _, r := range records {
-		if _, err := stmt.Exec(r.Key, r.UID, r.CopiedAtUnix); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return s.execBatch(insertCopied, len(records), func(i int) []any {
+		r := records[i]
+		return []any{r.Key, r.UID, r.CopiedAtUnix}
+	})
 }
 
-// DeletePendingBatch removes a batch of confirmed-applied pending operations
-// in one transaction.
-func (s *Store) DeletePendingBatch(ids []int64) error {
-	if len(ids) == 0 {
+// SeedBatch records dedup keys seeded from the destination (uid and
+// copied_at 0) in one transaction. Existing keys are skipped.
+func (s *Store) SeedBatch(keys []string) error {
+	return s.execBatch(insertCopied, len(keys), func(i int) []any {
+		return []any{keys[i], 0, 0}
+	})
+}
+
+// CopiedCount returns the number of recorded dedup keys.
+func (s *Store) CopiedCount() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM copied`).Scan(&n)
+	return n, err
+}
+
+// PendingOp is a queued destination mutation (move or keyword change).
+// It is enqueued in the same transaction as the membership change that
+// caused it and deleted only once applied (or definitively unnecessary).
+type PendingOp struct {
+	ID        int64
+	Kind      string // "move" | "keyword"
+	MessageID string // dedup key
+	Folder    string // the membership folder that changed
+	Op        string // "add" | "remove"
+}
+
+// MemberChangeItem is one membership change for MemberChangeBatch.
+type MemberChangeItem struct {
+	Key         string
+	UID         uint32
+	Add         bool
+	PendingKind string // "" = no pending op
+}
+
+// MemberChange is MemberChangeBatch for a single item.
+func (s *Store) MemberChange(folder, key string, uid uint32, add bool, pendingKind string) error {
+	return s.MemberChangeBatch(folder, []MemberChangeItem{{Key: key, UID: uid, Add: add, PendingKind: pendingKind}})
+}
+
+// MemberChangeBatch applies membership changes and enqueues their pending
+// ops in ONE transaction: a delta is either fully recorded or not at all.
+func (s *Store) MemberChangeBatch(folder string, items []MemberChangeItem) error {
+	if len(items) == 0 {
 		return nil
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	stmt, err := tx.Prepare(`DELETE FROM pending WHERE id = ?`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	for _, id := range ids {
-		if _, err := stmt.Exec(id); err != nil {
+	return s.inTx(func(tx *sql.Tx) error {
+		add, err := tx.Prepare(upsertMember)
+		if err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		defer add.Close()
+		del, err := tx.Prepare(deleteMember)
+		if err != nil {
+			return err
+		}
+		defer del.Close()
+		pend, err := tx.Prepare(insertPending)
+		if err != nil {
+			return err
+		}
+		defer pend.Close()
+		for _, it := range items {
+			op := "remove"
+			if it.Add {
+				op = "add"
+				_, err = add.Exec(folder, it.Key, it.UID)
+			} else {
+				_, err = del.Exec(folder, it.Key)
+			}
+			if err != nil {
+				return err
+			}
+			if it.PendingKind != "" {
+				if _, err := pend.Exec(it.PendingKind, it.Key, folder, op); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 }
 
 // MemberHas reports whether the message is a member of the folder.
 func (s *Store) MemberHas(folder, key string) (bool, error) {
-	var one int
-	err := s.db.QueryRow(`SELECT 1 FROM members WHERE folder = ? AND message_id = ?`, folder, key).Scan(&one)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	return err == nil, err
+	return s.exists(`SELECT 1 FROM members WHERE folder = ? AND message_id = ?`, folder, key)
 }
 
 // MemberFolders returns all folders the message is a member of, sorted.
 func (s *Store) MemberFolders(key string) ([]string, error) {
-	rows, err := s.db.Query(`SELECT folder FROM members WHERE message_id = ? ORDER BY folder`, key)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var folders []string
-	for rows.Next() {
+	err := s.queryEach(`SELECT folder FROM members WHERE message_id = ? ORDER BY folder`, func(rows *sql.Rows) error {
 		var f string
 		if err := rows.Scan(&f); err != nil {
-			return nil, err
+			return err
 		}
 		folders = append(folders, f)
-	}
-	return folders, rows.Err()
+		return nil
+	}, key)
+	return folders, err
 }
 
-// MemberUIDKeys returns uid -> dedup key for all members of a folder (used
-// by the membership diff; uid=0 placeholder rows from migration are skipped —
-// they are refreshed by the rebuild path).
+// MemberUIDKeys returns uid -> dedup key for all members of a folder. uid=0
+// placeholder rows (from migration) are skipped; the rebuild path refreshes
+// them.
 func (s *Store) MemberUIDKeys(folder string) (map[uint32]string, error) {
-	rows, err := s.db.Query(`SELECT uid, message_id FROM members WHERE folder = ? AND uid > 0`, folder)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	out := map[uint32]string{}
-	for rows.Next() {
+	err := s.queryEach(`SELECT uid, message_id FROM members WHERE folder = ? AND uid > 0`, func(rows *sql.Rows) error {
 		var uid uint32
 		var key string
 		if err := rows.Scan(&uid, &key); err != nil {
-			return nil, err
+			return err
 		}
 		out[uid] = key
-	}
-	return out, rows.Err()
+		return nil
+	}, folder)
+	return out, err
 }
 
 // MemberKeys returns the dedup keys of all members of a folder.
 func (s *Store) MemberKeys(folder string) (map[string]bool, error) {
-	rows, err := s.db.Query(`SELECT message_id FROM members WHERE folder = ?`, folder)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	out := map[string]bool{}
-	for rows.Next() {
+	err := s.queryEach(`SELECT message_id FROM members WHERE folder = ?`, func(rows *sql.Rows) error {
 		var key string
 		if err := rows.Scan(&key); err != nil {
-			return nil, err
+			return err
 		}
 		out[key] = true
-	}
-	return out, rows.Err()
+		return nil
+	}, folder)
+	return out, err
 }
 
 // PendingOps returns up to limit queued destination operations, oldest first.
 func (s *Store) PendingOps(limit int) ([]PendingOp, error) {
-	rows, err := s.db.Query(`SELECT id, kind, message_id, folder, op FROM pending ORDER BY id LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var ops []PendingOp
-	for rows.Next() {
+	err := s.queryEach(`SELECT id, kind, message_id, folder, op FROM pending ORDER BY id LIMIT ?`, func(rows *sql.Rows) error {
 		var op PendingOp
 		if err := rows.Scan(&op.ID, &op.Kind, &op.MessageID, &op.Folder, &op.Op); err != nil {
-			return nil, err
+			return err
 		}
 		ops = append(ops, op)
-	}
-	return ops, rows.Err()
+		return nil
+	}, limit)
+	return ops, err
 }
 
-// DeletePending removes a confirmed-applied pending operation.
+// DeletePending removes an applied pending operation.
 func (s *Store) DeletePending(id int64) error {
-	_, err := s.db.Exec(`DELETE FROM pending WHERE id = ?`, id)
+	_, err := s.db.Exec(deletePending, id)
 	return err
 }
 
-// MetaGet / MetaSet expose the meta table for feature markers (e.g. the
-// placement-backfill fingerprint).
-func (s *Store) MetaGet(key string) (string, error)   { return s.metaGet(key) }
-func (s *Store) MetaSet(key, value string) error      { return s.metaSet(key, value) }
+// DeletePendingBatch removes applied pending operations in one transaction.
+func (s *Store) DeletePendingBatch(ids []int64) error {
+	return s.execBatch(deletePending, len(ids), func(i int) []any { return []any{ids[i]} })
+}
 
-// FolderState returns the per-folder UIDVALIDITY and UID high-water mark used
-// by the label scan (0, 0 if the folder was never scanned).
+// FolderState returns the per-folder UIDVALIDITY and UID high-water mark
+// (0, 0 if the folder was never scanned).
 func (s *Store) FolderState(name string) (uidValidity, lastUID uint32, err error) {
-	var v, u uint32
-	err = s.db.QueryRow(`SELECT uidvalidity, last_uid FROM folders WHERE name = ?`, name).Scan(&v, &u)
-	if err == sql.ErrNoRows {
+	err = s.db.QueryRow(`SELECT uidvalidity, last_uid FROM folders WHERE name = ?`, name).Scan(&uidValidity, &lastUID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, nil
 	}
-	return v, u, err
+	return uidValidity, lastUID, err
 }
 
 // SetFolderState stores the per-folder UIDVALIDITY and UID high-water mark.
@@ -380,29 +352,4 @@ func (s *Store) SetFolderState(name string, uidValidity, lastUID uint32) error {
 		ON CONFLICT(name) DO UPDATE SET uidvalidity = excluded.uidvalidity, last_uid = excluded.last_uid`,
 		name, uidValidity, lastUID)
 	return err
-}
-
-// SeedBatch inserts a batch of dedup keys inside one transaction (used when
-// seeding from the destination folder). Existing keys are skipped.
-func (s *Store) SeedBatch(keys []string) error {
-	if len(keys) == 0 {
-		return nil
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT INTO copied (message_id, uid, copied_at) VALUES (?, 0, 0)
-		ON CONFLICT(message_id) DO NOTHING`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	for _, k := range keys {
-		if _, err := stmt.Exec(k); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }
