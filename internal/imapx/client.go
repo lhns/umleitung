@@ -94,12 +94,26 @@ func Dial(ep config.Endpoint) (*Client, error) {
 	return cl, nil
 }
 
+// logoutTimeout bounds the best-effort LOGOUT in Close.
+var logoutTimeout = 5 * time.Second
+
 // Close logs out (best effort) and closes the connection.
 func (cl *Client) Close() {
-	if cl.c != nil {
-		_ = cl.c.Logout().Wait()
-		_ = cl.c.Close()
+	if cl.c == nil {
+		return
 	}
+	// A half-open connection never answers LOGOUT; don't let that wedge the
+	// supervisor. Closing the conn unblocks the pending Wait.
+	done := make(chan struct{})
+	go func() {
+		_ = cl.c.Logout().Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(logoutTimeout):
+	}
+	_ = cl.c.Close()
 }
 
 // Notify delivers a signal whenever the server reports a mailbox change
