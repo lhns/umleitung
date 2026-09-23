@@ -2,6 +2,8 @@ package imapx
 
 import (
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,36 +11,26 @@ import (
 )
 
 func TestParseMetaHeader(t *testing.T) {
-	hdr := []byte("Message-Id: <abc@example.com>\r\n" +
-		"From: Alice <alice@example.com>\r\n" +
-		"Subject: Hello world\r\n" +
-		"\r\n")
-	mid, from, subject := parseMetaHeader(hdr)
-	if mid != "<abc@example.com>" {
-		t.Fatalf("mid = %q", mid)
-	}
-	if from == "" || subject == "" {
-		t.Fatalf("from = %q, subject = %q", from, subject)
-	}
-}
-
-func TestParseMetaHeaderFoldedMessageID(t *testing.T) {
-	// RFC 5322 folded header line.
-	hdr := []byte("Message-ID:\r\n <folded@example.com>\r\n\r\n")
-	mid, _, _ := parseMetaHeader(hdr)
-	if mid != "<folded@example.com>" {
-		t.Fatalf("mid = %q, want folded value", mid)
-	}
-}
-
-func TestParseMetaHeaderMissingMessageID(t *testing.T) {
-	hdr := []byte("From: a@b.c\r\nSubject: no id here\r\n\r\n")
-	mid, from, subject := parseMetaHeader(hdr)
-	if mid != "" {
-		t.Fatalf("mid = %q, want empty", mid)
-	}
-	if from != "a@b.c" || subject != "no id here" {
-		t.Fatalf("from = %q, subject = %q", from, subject)
+	for _, tc := range []struct {
+		name               string
+		hdr                string
+		mid, from, subject string
+	}{
+		{"all fields",
+			"Message-Id: <abc@example.com>\r\nFrom: Alice <alice@example.com>\r\nSubject: Hello world\r\n\r\n",
+			"<abc@example.com>", "Alice <alice@example.com>", "Hello world"},
+		{"folded Message-ID",
+			"Message-ID:\r\n <folded@example.com>\r\n\r\n",
+			"<folded@example.com>", "", ""},
+		{"missing Message-ID",
+			"From: a@b.c\r\nSubject: no id here\r\n\r\n",
+			"", "a@b.c", "no id here"},
+		{"empty", "", "", "", ""},
+	} {
+		mid, from, subject := parseMetaHeader([]byte(tc.hdr))
+		if mid != tc.mid || from != tc.from || subject != tc.subject {
+			t.Errorf("%s: got (%q, %q, %q), want (%q, %q, %q)", tc.name, mid, from, subject, tc.mid, tc.from, tc.subject)
+		}
 	}
 }
 
@@ -63,21 +55,20 @@ func TestOrMessageIDCriteria(t *testing.T) {
 		t.Fatalf("tree inner: %+v", inner)
 	}
 
-	// A full guard chunk must stay shallow: servers cap filter nesting depth
-	// (Stalwart: "BAD Too many nested filters" — seen in production with the
-	// previous 99-deep linear chain).
-	ids := make([]string, 100)
+	// A full guard chunk must stay shallow (Stalwart rejected the previous
+	// 99-deep linear chain with "BAD Too many nested filters").
+	ids := make([]string, defaultGuardChunk)
 	for i := range ids {
 		ids[i] = fmt.Sprintf("<m%d@x>", i)
 	}
-	if d := orDepth(orMessageIDCriteria(ids)); d > 8 {
-		t.Fatalf("OR-tree depth = %d for 100 ids, want <= 8 (balanced)", d)
+	tree := orMessageIDCriteria(ids)
+	if d := orDepth(tree); d > 8 {
+		t.Fatalf("OR-tree depth = %d for %d ids, want <= 8 (balanced)", d, len(ids))
 	}
-	// All leaves present exactly once.
 	leaves := map[string]int{}
-	countLeaves(orMessageIDCriteria(ids), leaves)
-	if len(leaves) != 100 {
-		t.Fatalf("leaves = %d, want 100", len(leaves))
+	countLeaves(tree, leaves)
+	if len(leaves) != len(ids) {
+		t.Fatalf("leaves = %d, want %d", len(leaves), len(ids))
 	}
 	for id, n := range leaves {
 		if n != 1 {
@@ -102,9 +93,81 @@ func countLeaves(c *imap.SearchCriteria, leaves map[string]int) {
 	countLeaves(&c.Or[0][1], leaves)
 }
 
-func TestParseMetaHeaderEmpty(t *testing.T) {
-	if mid, from, subject := parseMetaHeader(nil); mid != "" || from != "" || subject != "" {
-		t.Fatal("non-empty result for empty header")
+func selectOK(tag string) []string {
+	return []string{"* 0 EXISTS", "* OK [UIDVALIDITY 1] ok", tag + " OK [READ-WRITE] SELECT completed"}
+}
+
+// A server that rejects OR-trees with BAD must make the guard fall back to
+// smaller chunks (down to single-id searches) and remember that size.
+func TestSearchMessageIDsInShrinksChunkOnBad(t *testing.T) {
+	const hdr = "Message-Id: <hit@x>\r\n\r\n"
+	var orSearches atomic.Int32
+	ep := scriptedServer(t, func(tag, cmd string) []string {
+		switch {
+		case strings.HasPrefix(cmd, "SELECT"):
+			return selectOK(tag)
+		case strings.HasPrefix(cmd, "UID SEARCH") && strings.Contains(cmd, "OR "):
+			orSearches.Add(1)
+			return []string{tag + " BAD Too many nested filters"}
+		case strings.HasPrefix(cmd, "UID SEARCH") && strings.Contains(cmd, "<hit@x>"):
+			return []string{"* SEARCH 7", tag + " OK SEARCH completed"}
+		case strings.HasPrefix(cmd, "UID SEARCH"):
+			return []string{"* SEARCH", tag + " OK SEARCH completed"}
+		case strings.HasPrefix(cmd, "UID FETCH"):
+			return []string{
+				fmt.Sprintf("* 1 FETCH (UID 7 BODY[HEADER.FIELDS (Message-Id From Subject)] {%d}", len(hdr)),
+				hdr + ")",
+				tag + " OK FETCH completed",
+			}
+		}
+		return []string{tag + " BAD unexpected"}
+	})
+	cl, err := Dial(ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+
+	ids := []string{"<a@x>", "<hit@x>", "<c@x>"}
+	found, err := cl.SearchMessageIDsIn("INBOX", ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || !found["<hit@x>"] {
+		t.Fatalf("found = %v, want only <hit@x>", found)
+	}
+	if cl.guardChunk != 1 {
+		t.Fatalf("guardChunk = %d, want 1", cl.guardChunk)
+	}
+	// The shrunken chunk size sticks: no further OR searches.
+	before := orSearches.Load()
+	if _, err := cl.SearchMessageIDsIn("INBOX", ids); err != nil {
+		t.Fatal(err)
+	}
+	if n := orSearches.Load(); n != before {
+		t.Fatalf("second call issued %d OR searches, want 0", n-before)
+	}
+}
+
+// NO is a real failure, not a complexity limit: no retry, chunk unchanged.
+func TestSearchMessageIDsInFailsOnNo(t *testing.T) {
+	ep := scriptedServer(t, func(tag, cmd string) []string {
+		if strings.HasPrefix(cmd, "SELECT") {
+			return selectOK(tag)
+		}
+		return []string{tag + " NO server unavailable"}
+	})
+	cl, err := Dial(ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+
+	if _, err := cl.SearchMessageIDsIn("INBOX", []string{"<a@x>", "<b@x>"}); err == nil {
+		t.Fatal("want error")
+	}
+	if cl.guardChunk != defaultGuardChunk {
+		t.Fatalf("guardChunk = %d, want %d", cl.guardChunk, defaultGuardChunk)
 	}
 }
 
