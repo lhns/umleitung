@@ -3,8 +3,8 @@
 //
 // Safety-critical invariant: a dedup key is recorded ONLY after a confirmed
 // successful APPEND — never before. Combined with destination seeding and the
-// per-append destination guard, this makes duplicates impossible even across
-// crashes, state loss and UIDVALIDITY changes.
+// destination guard, this makes duplicates impossible even across crashes,
+// state loss and UIDVALIDITY changes.
 package reconcile
 
 import (
@@ -21,8 +21,7 @@ import (
 	"github.com/lhns/umleitung/internal/state"
 )
 
-// PendingOp is a queued destination mutation; aliased from the state package
-// so store implementations and the reconciler share one type.
+// PendingOp is a queued destination mutation.
 type PendingOp = state.PendingOp
 
 // Store is the persistent state needed by the reconciler.
@@ -32,20 +31,16 @@ type Store interface {
 	LastUID() (uint32, error)
 	SetLastUID(uint32) error
 	HasKey(key string) (bool, error)
-	RecordKey(key string, uid uint32, copiedAtUnix int64) error
-	CopiedCount() (int64, error)
 	SeedBatch(keys []string) error
 	RecordKeys(records []state.KeyRecord) error
 	FolderState(name string) (uidValidity, lastUID uint32, err error)
 	SetFolderState(name string, uidValidity, lastUID uint32) error
-	MemberChange(folder, key string, uid uint32, add bool, pendingKind string) error
 	MemberChangeBatch(folder string, items []state.MemberChangeItem) error
 	MemberHas(folder, key string) (bool, error)
 	MemberFolders(key string) ([]string, error)
 	MemberUIDKeys(folder string) (map[uint32]string, error)
 	MemberKeys(folder string) (map[string]bool, error)
 	PendingOps(limit int) ([]PendingOp, error)
-	DeletePending(id int64) error
 	DeletePendingBatch(ids []int64) error
 	MetaGet(key string) (string, error)
 	MetaSet(key, value string) error
@@ -79,29 +74,27 @@ type Dest interface {
 // Options tune the reconciler.
 type Options struct {
 	UIDBatch  int  // UID window size for the windowed, resumable scan
-	DestGuard bool // per-append `SEARCH HEADER Message-ID` on the destination
+	DestGuard bool // Message-ID search on the destination before appending
 	CarrySeen bool // propagate \Seen from source
 
 	SyncLabels   bool     // record source label-folder membership -> dest keywords
 	SourceFolder string   // the mirror source folder (excluded from label scan)
 	LabelExclude []string // additional folder names excluded from the label scan
 
-	DestFolder     string // primary destination folder
-	ArchiveRouting bool   // route by source-INBOX membership; propagate archive moves
-	SourceInbox    string // source folder whose membership means "in inbox"
-	ArchiveFolder  string // destination folder for archived mail
-	SentRouting    bool   // route by source-Sent membership; propagate moves
-	SentSrcFolder  string // resolved source folder whose membership means "sent"
-	SentFolder     string // destination folder for sent mail
+	DestFolder         string // primary destination folder
+	ArchiveRouting     bool   // route by source-INBOX membership; propagate archive moves
+	SourceInbox        string // source folder whose membership means "in inbox"
+	ArchiveFolder      string // destination folder for archived mail
+	SentRouting        bool   // route by source-Sent membership; propagate moves
+	SentSrcFolder      string // resolved source folder whose membership means "sent"
+	SentFolder         string // destination folder for sent mail
 	LabelPropagate     bool   // STORE keyword changes for post-copy label changes
 	KeywordPrefix      string // prepended to each label keyword (e.g. "$label:")
 	KeywordReplacement string // sanitization replacement char (default "_")
 
-	// OnProgress, if set, is called after every committed work window in any
-	// long-running phase (seeding, membership scan, mirror, backfill). Used
-	// as a liveness heartbeat and for progress reporting during large runs.
-	// item names the current work unit (e.g. "Work 3/12" for folder 3 of 12);
-	// empty when the phase has a single implicit unit.
+	// OnProgress, if set, is called after committed work in every
+	// long-running phase (liveness heartbeat + progress reporting). item
+	// names the current work unit (e.g. "Work 3/12"), or is empty.
 	OnProgress func(phase, item string, processed int)
 }
 
@@ -139,7 +132,6 @@ type Reconciler struct {
 	dst   Dest
 	opts  Options
 	log   *slog.Logger
-	now   func() time.Time
 }
 
 // New creates a Reconciler.
@@ -147,18 +139,16 @@ func New(store Store, src Source, dst Dest, opts Options, log *slog.Logger) *Rec
 	if opts.UIDBatch < 1 {
 		opts.UIDBatch = 2000
 	}
-	return &Reconciler{store: store, src: src, dst: dst, opts: opts, log: log, now: time.Now}
+	return &Reconciler{store: store, src: src, dst: dst, opts: opts, log: log}
 }
 
 // Run performs one full reconcile pass. It is safe to call any number of
-// times; it never duplicates. Respects ctx between messages so shutdown can
-// interrupt a large catch-up without tearing a message in half.
+// times; it never duplicates. ctx is checked between messages, so shutdown
+// never tears a message in half.
 func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 	sum := &Summary{}
 
-	// Membership phase first (label folders + source INBOX), so routing and
-	// copy-time keywords see current state. (Leaves some watched folder
-	// selected; the SelectFolder below re-selects the mirror source folder.)
+	// Membership first, so routing and copy-time keywords see current state.
 	if r.opts.SyncLabels && !r.dst.SupportsArbitraryKeywords() {
 		r.log.Warn("destination does not advertise arbitrary keyword support (PERMANENTFLAGS \\*); labels may be dropped")
 	}
@@ -170,7 +160,6 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 	if err != nil {
 		return sum, err
 	}
-
 	storedValidity, err := r.store.UIDValidity()
 	if err != nil {
 		return sum, err
@@ -182,8 +171,8 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 
 	if storedValidity != uidValidity {
 		if storedValidity != 0 {
-			// UIDs are meaningless now; rescan everything. The dedup-key set
-			// still prevents any duplicate appends.
+			// UIDs are meaningless now; rescan everything. The dedup set
+			// prevents duplicate appends.
 			r.log.Warn("UIDVALIDITY changed — resetting high-water mark, dedup set protects against dupes",
 				"stored", storedValidity, "current", uidValidity)
 			sum.UIDValidityChanged = true
@@ -199,50 +188,59 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 		}
 	}
 
-	// Placement/keyword backfill: auto-corrects mail mirrored before the
-	// current routing/label config was active (config fingerprint change).
-	// Runs BEFORE the mirror loop so a config change (e.g. new keyword prefix)
-	// re-tags already-mirrored mail promptly, not only after a days-long first
-	// run finishes. Touches only the destination connection; the source stays
-	// selected for the loop below.
+	// Backfill before the mirror loop so a config change re-tags existing
+	// mail promptly, not only after a days-long first run. It touches only
+	// the destination connection; the source stays selected.
 	if err := r.maybeBackfill(ctx, sum); err != nil {
 		return sum, fmt.Errorf("backfill: %w", err)
 	}
 
-	// Windowed, resumable scan: [lastUID+1 .. uidNext-1] in UIDBatch windows.
-	// last_uid is committed once per window, so a crash or a provider-throttle
-	// disconnect resumes from the last committed window.
-	for start := uint32(lastUID) + 1; start < uidNext; start += uint32(r.opts.UIDBatch) {
-		if err := ctx.Err(); err != nil {
-			return sum, err
-		}
-		stop := min(start+uint32(r.opts.UIDBatch)-1, uidNext-1)
-
-		metas, err := r.src.FetchMetaRange(imap.UID(start), imap.UID(stop))
-		if err != nil {
-			return sum, fmt.Errorf("window %d:%d: %w", start, stop, err)
-		}
+	// last_uid is committed per window, so a crash or throttle disconnect
+	// resumes from the last committed window.
+	err = r.scanWindows(ctx, lastUID+1, uidNext, r.src.FetchMetaRange, func(stop uint32, metas []imapx.MsgMeta) error {
 		sum.Candidates += len(metas)
-
 		if err := r.mirrorWindow(ctx, metas, sum); err != nil {
-			return sum, fmt.Errorf("window %d:%d: %w", start, stop, err)
+			return err
 		}
-
-		// Per-window high-water-mark commit (resumable first run).
 		if err := r.store.SetLastUID(stop); err != nil {
-			return sum, err
+			return err
 		}
 		r.opts.progress("mirror", "", sum.Copied)
+		return nil
+	})
+	if err != nil {
+		return sum, err
 	}
 
-	// Apply queued destination mutations (routing moves, keyword updates).
 	if r.opts.ArchiveRouting || r.opts.SentRouting || r.opts.LabelPropagate {
 		if err := r.propagate(ctx, sum); err != nil {
 			return sum, fmt.Errorf("propagate: %w", err)
 		}
 	}
-
 	return sum, nil
+}
+
+// scanWindows fetches UIDs [first, uidNext-1] in UIDBatch windows and passes
+// each window's metadata to fn.
+func (r *Reconciler) scanWindows(ctx context.Context, first, uidNext uint32,
+	fetch func(start, stop imap.UID) ([]imapx.MsgMeta, error),
+	fn func(stop uint32, metas []imapx.MsgMeta) error,
+) error {
+	batch := uint32(r.opts.UIDBatch)
+	for start := first; start < uidNext; start += batch {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		stop := min(start+batch-1, uidNext-1)
+		metas, err := fetch(imap.UID(start), imap.UID(stop))
+		if err == nil {
+			err = fn(stop, metas)
+		}
+		if err != nil {
+			return fmt.Errorf("window %d:%d: %w", start, stop, err)
+		}
+	}
+	return nil
 }
 
 // pendingCopy is a classified candidate awaiting its body copy.
@@ -252,19 +250,15 @@ type pendingCopy struct {
 	destFolder string
 }
 
-// pipelineDepth bounds in-flight messages between the Gmail fetch stream and
-// the Stalwart append consumer (memory bound: depth × message size).
+// pipelineDepth bounds bodies buffered between the source fetch stream and
+// the destination append consumer (memory: depth × message size).
 const pipelineDepth = 8
 
-// mirrorWindow mirrors one window of candidates in three passes:
-//  1. classify (local): dedup lookup + routing per candidate
-//  2. batched destination guard: ONE Message-ID batch search per dest folder
-//     (every candidate is still guarded — only the transport is batched)
-//  3. copy: one streaming FETCH for all pending bodies, appends running
-//     concurrently in a bounded FIFO pipeline (append-then-record per
-//     message, exactly as before)
+// mirrorWindow mirrors one window of candidates:
+//  1. classify locally: dedup lookup + routing
+//  2. destination guard: one batched Message-ID search per dest folder
+//  3. copy: one streamed FETCH feeding a bounded append pipeline
 func (r *Reconciler) mirrorWindow(ctx context.Context, metas []imapx.MsgMeta, sum *Summary) error {
-	// Pass 1: classification.
 	var pend []pendingCopy
 	pendKeys := map[string]bool{} // same key twice in one window: copy once
 	for i := range metas {
@@ -287,50 +281,53 @@ func (r *Reconciler) mirrorWindow(ctx context.Context, metas []imapx.MsgMeta, su
 		}
 		pend = append(pend, pendingCopy{uid: metas[i].UID, key: key, destFolder: destFolder})
 	}
+
+	if r.opts.DestGuard && len(pend) > 0 {
+		var err error
+		if pend, err = r.guard(pend, sum); err != nil {
+			return err
+		}
+	}
 	if len(pend) == 0 {
 		return nil
 	}
+	return r.copyPipeline(ctx, pend, sum)
+}
 
-	// Pass 2: batched destination guard (both folders under routing — the
-	// copy may have been moved).
-	if r.opts.DestGuard {
-		var ids []string
-		for _, p := range pend {
-			if IsRealMessageID(p.key) {
-				ids = append(ids, p.key)
-			}
-		}
-		found := map[string]bool{}
-		if len(ids) > 0 {
-			for _, folder := range r.destBucketFolders() {
-				f, err := r.dst.SearchMessageIDsIn(folder, ids)
-				if err != nil {
-					return err
-				}
-				for id := range f {
-					found[id] = true
-				}
-			}
-		}
-		kept := pend[:0]
-		for _, p := range pend {
-			if found[p.key] {
-				sum.SkippedDup++
-				if err := r.store.RecordKey(p.key, uint32(p.uid), r.now().Unix()); err != nil {
-					return err
-				}
-				continue
-			}
-			kept = append(kept, p)
-		}
-		pend = kept
-		if len(pend) == 0 {
-			return nil
+// guard drops candidates already present in any destination bucket (the
+// copy may have been moved) and records them — the self-heal for the
+// appended-but-unrecorded crash window. Synthesized keys are unsearchable.
+func (r *Reconciler) guard(pend []pendingCopy, sum *Summary) ([]pendingCopy, error) {
+	var ids []string
+	for _, p := range pend {
+		if IsRealMessageID(p.key) {
+			ids = append(ids, p.key)
 		}
 	}
-
-	// Pass 3: streamed copy with a bounded fetch/append pipeline.
-	return r.copyPipeline(ctx, pend, sum)
+	if len(ids) == 0 {
+		return pend, nil
+	}
+	found := map[string]bool{}
+	for _, folder := range r.destBucketFolders() {
+		f, err := r.dst.SearchMessageIDsIn(folder, ids)
+		if err != nil {
+			return nil, err
+		}
+		for id := range f {
+			found[id] = true
+		}
+	}
+	var records []state.KeyRecord
+	kept := pend[:0]
+	for _, p := range pend {
+		if found[p.key] {
+			sum.SkippedDup++
+			records = append(records, state.KeyRecord{Key: p.key, UID: uint32(p.uid), CopiedAtUnix: time.Now().Unix()})
+			continue
+		}
+		kept = append(kept, p)
+	}
+	return kept, r.store.RecordKeys(records)
 }
 
 type copyItem struct {
@@ -347,20 +344,17 @@ type inflightAppend struct {
 	hadKeywords bool
 }
 
-// appendRing bounds pipelined (issued-but-unconfirmed) APPENDs; together
-// with recordFlushSize this is the crash window the batched destination
-// guard covers (appended-but-unrecorded messages are re-detected next run).
+// appendRing bounds issued-but-unconfirmed APPENDs; together with
+// recordFlushSize it is the crash window the destination guard covers.
 const (
 	appendRing      = 4
 	recordFlushSize = 50
 )
 
 // copyPipeline overlaps the source body stream (producer) with destination
-// appends (consumer). Single producer + single consumer = FIFO order; the
-// consumer alone touches the store. Appends are pipelined (ring of
-// appendRing in flight — no per-message dest round trip) and dedup records
-// are flushed in batched transactions (recordFlushSize, at stream end, and
-// on any error — state stays behind reality, never ahead).
+// appends (consumer). Single producer + single consumer = FIFO order; only
+// the consumer touches the store. Dedup records are flushed in batches, at
+// stream end, and on any error — state stays behind reality, never ahead.
 func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *Summary) error {
 	byUID := make(map[imap.UID]pendingCopy, len(pend))
 	uids := make([]imap.UID, 0, len(pend))
@@ -369,10 +363,8 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 		uids = append(uids, p.uid)
 	}
 
-	// With the destination guard disabled there is no layer that re-detects
-	// appended-but-unrecorded messages after a crash — degrade to the strict
-	// synchronous mode (1 in-flight append, record flushed per message) so
-	// the crash window stays at a single message.
+	// Without the guard nothing re-detects appended-but-unrecorded messages
+	// after a crash: degrade to one in-flight append, recorded immediately.
 	ringLimit, flushLimit := appendRing, recordFlushSize
 	if !r.opts.DestGuard {
 		ringLimit, flushLimit = 1, 1
@@ -404,41 +396,38 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 			}
 			records = records[:0]
 		}
-		// settleOldest confirms the oldest in-flight append and buffers its
-		// record — APPEND confirmed first, record after, never the reverse.
+		// settleOldest confirms the oldest in-flight append, then buffers
+		// its record.
 		settleOldest := func() {
 			it := ring[0]
 			ring = ring[1:]
 			keywordsLanded := it.hadKeywords
 			if err := it.pa.Wait(); err != nil {
-				// The keyword-less retry is only safe when the SERVER
-				// rejected the append (tagged NO/BAD = definitely not
-				// stored). On a connection-level error the append may have
-				// landed — retrying could duplicate; abort instead and let
-				// the destination guard reconcile on the next pass.
+				// Retrying is only safe on a tagged NO/BAD (definitely not
+				// stored). A connection error may have stored it — abort and
+				// let the guard reconcile next pass.
 				if !it.hadKeywords || !isServerReject(err) {
 					fail(fmt.Errorf("uid %d: %w", it.pc.uid, err))
 					return
 				}
-				// The mirror always wins over label decoration: retry once
-				// without keywords before treating this as an error.
+				// The mirror wins over label decoration: retry without keywords.
 				r.log.Warn("append with label keywords rejected; retrying without keywords",
 					"uid", it.pc.uid, "err", err)
 				if err := r.dst.AppendTo(it.pc.destFolder, it.full, it.baseFlags); err != nil {
 					fail(fmt.Errorf("uid %d: %w", it.pc.uid, err))
 					return
 				}
-				keywordsLanded = false // fallback stripped them
+				keywordsLanded = false
 			}
 			if keywordsLanded {
 				sum.KeywordsSet++
 			}
 			records = append(records, state.KeyRecord{
-				Key: it.pc.key, UID: uint32(it.pc.uid), CopiedAtUnix: r.now().Unix(),
+				Key: it.pc.key, UID: uint32(it.pc.uid), CopiedAtUnix: time.Now().Unix(),
 			})
 			sum.Copied++
-			// Every copy: keeps the heartbeat fresh and progress lines
-			// flowing even when the provider bandwidth-shapes the stream.
+			// Per copy: keeps the heartbeat fresh even when the provider
+			// bandwidth-shapes the stream.
 			r.opts.progress("mirror", "", sum.Copied)
 			if len(records) >= flushLimit {
 				flushRecords()
@@ -459,7 +448,7 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 					continue
 				}
 				keywords = r.labelKeywords(labels)
-				flags = append(append([]imap.Flag{}, baseFlags...), keywords...)
+				flags = append(slices.Clone(baseFlags), keywords...)
 			}
 			pa, err := r.dst.BeginAppend(it.pc.destFolder, it.full, flags)
 			if err != nil {
@@ -489,7 +478,7 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 		case ch <- copyItem{full: full, pc: pc}:
 			return nil
 		case <-failed:
-			return fmt.Errorf("append side failed")
+			return errors.New("append side failed")
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -506,17 +495,15 @@ func (r *Reconciler) copyPipeline(ctx context.Context, pend []pendingCopy, sum *
 	return ctx.Err()
 }
 
-// isServerReject reports whether err is a tagged server response (NO/BAD):
-// the server processed the command and definitively did NOT store the
-// message, making a retry safe. Connection-level errors return false.
+// isServerReject reports whether err is a tagged NO/BAD: the server
+// definitively did NOT store the message, so a retry is safe.
 func isServerReject(err error) bool {
 	var imapErr *imap.Error
 	return errors.As(err, &imapErr)
 }
 
-// safeFlags builds the flag set for the destination APPEND: optionally carry
-// \Seen; never propagate anything else (no \Deleted, no \Recent, no provider-specific
-// labels/keywords).
+// safeFlags returns the APPEND flags: \Seen if carried, nothing else (no
+// \Deleted, \Recent or provider-specific keywords).
 func safeFlags(src []imap.Flag, carrySeen bool) []imap.Flag {
 	if carrySeen && slices.Contains(src, imap.FlagSeen) {
 		return []imap.Flag{imap.FlagSeen}
@@ -524,11 +511,9 @@ func safeFlags(src []imap.Flag, carrySeen bool) []imap.Flag {
 	return nil
 }
 
-// SeedFromDest streams the destination folders' dedup keys into the store in
-// batches. This bootstraps idempotency against a pre-populated destination and
-// re-derives the truth after local state loss. With archive routing enabled,
-// BOTH destination folders are scanned. Memory stays bounded: one UID window
-// of header metadata at a time.
+// SeedFromDest streams the dedup keys of every destination bucket into the
+// store, bootstrapping idempotency against a pre-populated destination or
+// after local state loss. Memory stays bounded to one UID window.
 func (r *Reconciler) SeedFromDest(ctx context.Context) (int64, error) {
 	folders := r.destBucketFolders()
 	var seeded int64
@@ -544,31 +529,21 @@ func (r *Reconciler) SeedFromDest(ctx context.Context) (int64, error) {
 
 func (r *Reconciler) seedFromDestFolder(ctx context.Context, folder, item string) (int64, error) {
 	_, uidNext, numMessages, err := r.dst.SelectNamedFolder(folder)
-	if err != nil {
+	if err != nil || numMessages == 0 {
 		return 0, err
 	}
-	if numMessages == 0 {
-		return 0, nil
-	}
 	var seeded int64
-	for start := uint32(1); start < uidNext; start += uint32(r.opts.UIDBatch) {
-		if err := ctx.Err(); err != nil {
-			return seeded, err
-		}
-		stop := min(start+uint32(r.opts.UIDBatch)-1, uidNext-1)
-		metas, err := r.dst.FetchMetaRange(imap.UID(start), imap.UID(stop))
-		if err != nil {
-			return seeded, fmt.Errorf("seed window %d:%d: %w", start, stop, err)
-		}
+	err = r.scanWindows(ctx, 1, uidNext, r.dst.FetchMetaRange, func(_ uint32, metas []imapx.MsgMeta) error {
 		keys := make([]string, 0, len(metas))
 		for i := range metas {
 			keys = append(keys, DedupKey(&metas[i]))
 		}
 		if err := r.store.SeedBatch(keys); err != nil {
-			return seeded, err
+			return err
 		}
 		seeded += int64(len(keys))
 		r.opts.progress("seed", item, int(seeded))
-	}
-	return seeded, nil
+		return nil
+	})
+	return seeded, err
 }
