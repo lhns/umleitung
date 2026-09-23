@@ -188,11 +188,13 @@ func (r *Reconciler) Run(ctx context.Context) (*Summary, error) {
 				"stored", storedValidity, "current", uidValidity)
 			sum.UIDValidityChanged = true
 		}
+		// Reset the high-water mark BEFORE adopting the new UIDVALIDITY: a
+		// crash in between must re-trigger the reset, not leave a stale mark.
 		lastUID = 0
-		if err := r.store.SetUIDValidity(uidValidity); err != nil {
+		if err := r.store.SetLastUID(0); err != nil {
 			return sum, err
 		}
-		if err := r.store.SetLastUID(0); err != nil {
+		if err := r.store.SetUIDValidity(uidValidity); err != nil {
 			return sum, err
 		}
 	}
@@ -264,6 +266,7 @@ const pipelineDepth = 8
 func (r *Reconciler) mirrorWindow(ctx context.Context, metas []imapx.MsgMeta, sum *Summary) error {
 	// Pass 1: classification.
 	var pend []pendingCopy
+	pendKeys := map[string]bool{} // same key twice in one window: copy once
 	for i := range metas {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -273,10 +276,11 @@ func (r *Reconciler) mirrorWindow(ctx context.Context, metas []imapx.MsgMeta, su
 		if err != nil {
 			return err
 		}
-		if seen {
+		if seen || pendKeys[key] {
 			sum.SkippedDup++
 			continue
 		}
+		pendKeys[key] = true
 		destFolder, err := r.destFolderFor(key)
 		if err != nil {
 			return err

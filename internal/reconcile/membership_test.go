@@ -657,3 +657,71 @@ func TestGuardChecksBothFoldersUnderRouting(t *testing.T) {
 		t.Fatalf("total = %d, want 3", dst.total())
 	}
 }
+
+// A sent source folder without the \Sent attribute is a routing folder, not
+// a label: membership changes must move the copy, never add a keyword.
+func TestSentFolderWithoutSpecialUseRoutesNotLabels(t *testing.T) {
+	store, src, dst := sentSetup() // SENTSRC has no \Sent attribute
+	opts := sentOpts()
+	opts.SyncLabels, opts.LabelPropagate, opts.SourceFolder = true, true, fakeMainFolder
+	rec := newRec(store, src, dst, opts)
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Archived m3 shows up in the sent folder after the copy.
+	src.labelFolders["SENTSRC"].msgs = append(src.labelFolders["SENTSRC"].msgs, msg(5, "<m3@x>", "raw-3"))
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.MovedToSent != 1 || sum.KeywordsUpdated != 0 {
+		t.Fatalf("got %+v, want 1 move to sent and no keyword updates", sum)
+	}
+	if has, _ := dst.HasMessageIDIn(fakeSentFolder, "<m3@x>"); !has {
+		t.Fatal("m3 not moved to the sent folder")
+	}
+	if m3 := findDstMsg(dst, "<m3@x>"); slices.Contains(m3.flags, imap.Flag("sentsrc")) {
+		t.Fatalf("sent folder leaked as keyword: %v", m3.flags)
+	}
+}
+
+// Backfill must add label keywords to messages it moves, including moves
+// into a bucket that was already scanned (Archive -> Sent).
+func TestBackfillKeywordsOnMovedMessages(t *testing.T) {
+	store, src, dst := sentSetup()
+	src.labelFolders["Work"] = &fakeLabelFolder{uidValidity: 72, msgs: []fakeMsg{msg(2, "<m2@x>", "raw-2")}}
+
+	// Phase 1: archive routing only, no labels — m2 lands in ARCHIVE untagged.
+	rec := newRec(store, src, dst, Options{ArchiveRouting: true, SourceFolder: fakeMainFolder})
+	if _, err := rec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase 2: sent routing + labels -> backfill moves m2 to SENT and tags it.
+	opts := sentOpts()
+	opts.SyncLabels, opts.SourceFolder = true, fakeMainFolder
+	if _, err := newRec(store, src, dst, opts).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if has, _ := dst.HasMessageIDIn(fakeSentFolder, "<m2@x>"); !has {
+		t.Fatal("m2 not moved to the sent folder")
+	}
+	if m2 := findDstMsg(dst, "<m2@x>"); !slices.Contains(m2.flags, imap.Flag("work")) {
+		t.Fatalf("moved message missing backfilled keyword: %v", m2.flags)
+	}
+}
+
+// A rebuild against a server that omits UIDNEXT must not wrap the stored
+// high-water mark to 2^32-1 (later scans would then start at UID 0).
+func TestRebuildWithoutUIDNextKeepsHighWaterMark(t *testing.T) {
+	store, src, dst := routingSetup()
+	src.labelFolders["INBOX"].msgs = nil
+	src.labelFolders["INBOX"].noUIDNext = true
+	if _, err := newRec(store, src, dst, routingOpts()).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if v, last, _ := store.FolderState("INBOX"); v != 70 || last != 0 {
+		t.Fatalf("folder state = (%d, %d), want (70, 0)", v, last)
+	}
+}
