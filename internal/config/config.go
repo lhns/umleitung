@@ -226,6 +226,11 @@ func resolve(raw *rawConfig) (*Config, error) {
 		cfg.HealthAddr = v // explicit null/"" disables
 	}
 	cfg.LockPath = defaultStr(raw.LockPath, filepath.Join(cfg.StateDir, "umleiter.lock"))
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		fail("log_level must be debug|info|warn|error, got %q", cfg.LogLevel)
+	}
 
 	if len(raw.Mirrors) == 0 {
 		fail("at least one mirror is required")
@@ -272,10 +277,12 @@ func resolve(raw *rawConfig) (*Config, error) {
 		names[rm.Name] = true
 
 		m.StatePath = defaultStr(rm.StatePath, filepath.Join(cfg.StateDir, rm.Name+".db"))
-		if other, dup := statePaths[m.StatePath]; dup {
+		// Clean so "/s/a.db" and "/s/./a.db" are recognized as the same db.
+		statePath := filepath.Clean(m.StatePath)
+		if other, dup := statePaths[statePath]; dup {
 			fail("%s: state_path %q already used by mirror %q", where, m.StatePath, other)
 		}
-		statePaths[m.StatePath] = rm.Name
+		statePaths[statePath] = rm.Name
 
 		var err error
 		if m.Source, err = resolveEndpoint(&rm.Source, "INBOX"); err != nil {
@@ -310,6 +317,14 @@ func resolve(raw *rawConfig) (*Config, error) {
 		if m.UIDBatch < 1 {
 			fail("%s: uid_batch must be >= 1", where)
 		}
+		// A negative interval would make the sync loop spin and /healthz
+		// (staleness = 3 * poll_interval) permanently unhealthy.
+		if m.PollInterval < 0 {
+			fail("%s: poll_interval must be positive", where)
+		}
+		if m.IdleReset < 0 {
+			fail("%s: idle_reset must be positive", where)
+		}
 
 		cfg.Mirrors = append(cfg.Mirrors, m)
 	}
@@ -334,6 +349,9 @@ func resolveEndpoint(raw *rawEndpoint, defaultFolder string) (Endpoint, error) {
 	}
 	if ep.User == "" {
 		return ep, fmt.Errorf("user is required")
+	}
+	if ep.Port < 1 || ep.Port > 65535 {
+		return ep, fmt.Errorf("port must be 1-65535, got %d", ep.Port)
 	}
 	switch {
 	case raw.Password != "" && raw.PasswordFile != "":
