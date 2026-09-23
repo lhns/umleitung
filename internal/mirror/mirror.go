@@ -40,27 +40,39 @@ func Run(ctx context.Context, m config.Mirror, log *slog.Logger, heartbeat *atom
 
 	// Supervision loop: (re)connect with exponential backoff; provider
 	// throttle/quota disconnects land here and simply back off and resume.
-	backoff := time.Second
-	const maxBackoff = 5 * time.Minute
-	for {
-		if ctx.Err() != nil {
-			log.Info("mirror shutting down")
-			return nil
-		}
+	var wait time.Duration
+	for ctx.Err() == nil {
 		heartbeat.Store(time.Now().Unix())
+		start := time.Now()
 		err := runSession(ctx, m, store, log, heartbeat)
 		if err == nil || errors.Is(err, context.Canceled) {
-			log.Info("mirror shutting down")
-			return nil
+			break
 		}
 		heartbeat.Store(time.Now().Unix())
-		log.Error("session ended, will reconnect", "err", err, "backoff", backoff)
+		wait = backoff(wait, time.Since(start))
+		log.Error("session ended, will reconnect", "err", err, "backoff", wait)
 		select {
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		case <-ctx.Done():
 		}
-		backoff = min(backoff*2, maxBackoff)
 	}
+	log.Info("mirror shutting down")
+	return nil
+}
+
+const (
+	initialBackoff = time.Second
+	maxBackoff     = 5 * time.Minute
+)
+
+// backoff returns the reconnect delay after a session that lasted uptime,
+// given the previous delay (0 = none yet). A session that stayed up for
+// maxBackoff counts as healthy and restarts the sequence.
+func backoff(prev, uptime time.Duration) time.Duration {
+	if prev == 0 || uptime >= maxBackoff {
+		return initialBackoff
+	}
+	return min(prev*2, maxBackoff)
 }
 
 // runSession connects both endpoints and runs reconcile+IDLE until an error
