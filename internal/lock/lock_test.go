@@ -38,3 +38,11 @@ func TestReacquireAfterRelease(t *testing.T) {
 	}
 	l2.Release()
 }
+
+func TestAcquireUnopenablePathFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-dir", "test.lock")
+	if l, err := Acquire(path); err == nil {
+		l.Release()
+		t.Fatal("acquired a lock in a nonexistent directory")
+	}
+}
