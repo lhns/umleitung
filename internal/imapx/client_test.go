@@ -3,6 +3,7 @@ package imapx
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 )
@@ -104,5 +105,25 @@ func countLeaves(c *imap.SearchCriteria, leaves map[string]int) {
 func TestParseMetaHeaderEmpty(t *testing.T) {
 	if mid, from, subject := parseMetaHeader(nil); mid != "" || from != "" || subject != "" {
 		t.Fatal("non-empty result for empty header")
+	}
+}
+
+// Regression: Close used to block forever on a half-open connection that
+// never answers LOGOUT, wedging the mirror supervisor.
+func TestCloseDoesNotHangOnUnansweredLogout(t *testing.T) {
+	ep := scriptedServer(t, func(tag, cmd string) []string { return nil })
+	cl, err := Dial(ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(d time.Duration) { logoutTimeout = d }(logoutTimeout)
+	logoutTimeout = 50 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() { cl.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung on unanswered LOGOUT")
 	}
 }
