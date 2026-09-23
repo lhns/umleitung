@@ -31,11 +31,15 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
 		os.Exit(healthcheck())
 	}
+	os.Exit(run())
+}
 
+// run starts all mirrors and blocks until shutdown; it returns the exit code.
+func run() int {
 	cfg, err := config.LoadFile(config.Path())
 	if err != nil {
 		slog.Error("invalid configuration", "err", err)
-		os.Exit(2)
+		return 2
 	}
 
 	log := newLogger(cfg.LogLevel)
@@ -46,7 +50,7 @@ func main() {
 	l, err := lock.Acquire(cfg.LockPath)
 	if err != nil {
 		log.Error("startup lock failed", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	defer l.Release()
 
@@ -84,18 +88,26 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
+	var failed atomic.Bool
 	for i, m := range cfg.Mirrors {
-		wg.Add(1)
-		go func(m config.Mirror, beat *atomic.Int64) {
-			defer wg.Done()
+		beat := health[i].beat
+		wg.Go(func() {
 			if err := mirror.Run(ctx, m, log, beat); err != nil {
+				// A mirror that cannot run at all (e.g. state db) takes the
+				// instance down with a non-zero exit so it gets restarted.
 				log.Error("mirror failed", "mirror", m.Name, "err", err)
-				stop() // a mirror that cannot run at all (e.g. state db) takes the instance down for a clean restart
+				failed.Store(true)
+				stop()
 			}
-		}(m, health[i].beat)
+		})
 	}
 	wg.Wait()
+	if failed.Load() {
+		log.Error("umleiter stopped after mirror failure")
+		return 1
+	}
 	log.Info("umleiter stopped")
+	return 0
 }
 
 // healthcheck probes the local /healthz endpoint of the running instance.
