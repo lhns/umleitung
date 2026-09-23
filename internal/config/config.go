@@ -285,10 +285,10 @@ func resolve(raw *rawConfig) (*Config, error) {
 		statePaths[statePath] = rm.Name
 
 		var err error
-		if m.Source, err = resolveEndpoint(&rm.Source, "INBOX"); err != nil {
+		if m.Source, err = resolveEndpoint(&rm.Source); err != nil {
 			fail("%s source: %v", where, err)
 		}
-		if m.Dest, err = resolveEndpoint(&rm.Dest, "INBOX"); err != nil {
+		if m.Dest, err = resolveEndpoint(&rm.Dest); err != nil {
 			fail("%s dest: %v", where, err)
 		}
 
@@ -300,7 +300,7 @@ func resolve(raw *rawConfig) (*Config, error) {
 		if m.Labels.Propagate && !m.Labels.Enabled {
 			fail("%s: labels.propagate requires labels.enabled", where)
 		}
-		if r := m.Labels.KeywordReplacement; len([]rune(r)) != 1 || !isKeywordChar(r[0]) {
+		if r := m.Labels.KeywordReplacement; len(r) != 1 || !isKeywordChar(r[0]) {
 			fail("%s: labels.keyword_replacement must be a single keyword char [A-Za-z0-9_-], got %q", where, r)
 		}
 		if m.Archive.Enabled && m.Archive.Folder == m.Dest.Folder {
@@ -335,12 +335,12 @@ func resolve(raw *rawConfig) (*Config, error) {
 	return cfg, nil
 }
 
-func resolveEndpoint(raw *rawEndpoint, defaultFolder string) (Endpoint, error) {
+func resolveEndpoint(raw *rawEndpoint) (Endpoint, error) {
 	ep := Endpoint{
 		Host:   raw.Host,
 		Port:   defaultInt(raw.Port, 993),
 		User:   raw.User,
-		Folder: defaultStr(raw.Folder, defaultFolder),
+		Folder: defaultStr(raw.Folder, "INBOX"),
 		Inbox:  defaultStr(raw.Inbox, "INBOX"),
 		TLS:    defaultBool(raw.TLS, true),
 	}
