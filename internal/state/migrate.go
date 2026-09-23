@@ -70,8 +70,8 @@ DELETE FROM folders;
 `,
 }
 
-// migrate brings the database to schemaVersion. Refuses to open databases
-// created by a NEWER binary (downgrade protection).
+// migrate brings the database to schemaVersion. Refuses databases created by
+// a NEWER binary (downgrade protection).
 func migrate(db *sql.DB) error {
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
@@ -81,22 +81,26 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("state db has schema version %d, but this binary supports at most %d — refusing to downgrade", version, schemaVersion)
 	}
 	for v := version; v < schemaVersion; v++ {
-		tx, err := db.Begin()
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(migrations[v]); err != nil {
-			tx.Rollback()
+		if err := migrateStep(db, v); err != nil {
 			return fmt.Errorf("migrate schema v%d -> v%d: %w", v, v+1, err)
-		}
-		// PRAGMA does not support placeholders; v+1 is a trusted constant.
-		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, v+1)); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("bump schema version to %d: %w", v+1, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration to v%d: %w", v+1, err)
 		}
 	}
 	return nil
+}
+
+// migrateStep applies migrations[v] and bumps user_version in one transaction.
+func migrateStep(db *sql.DB, v int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(migrations[v]); err != nil {
+		return err
+	}
+	// PRAGMA does not support placeholders; v+1 is a trusted constant.
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, v+1)); err != nil {
+		return fmt.Errorf("bump user_version: %w", err)
+	}
+	return tx.Commit()
 }
