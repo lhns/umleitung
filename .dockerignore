@@ -1,7 +1,16 @@
 .git
+.github
+.claude
 .gitignore
+.env
 state/
+*.db
+*.db-wal
+*.db-shm
 *.md
+docs/
 docker-compose.yml
 stack.yml
-.env
+umleiter.yaml
+/umleiter
+/umleiter.exe
