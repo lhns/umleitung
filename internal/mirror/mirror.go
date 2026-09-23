@@ -76,7 +76,7 @@ func backoff(prev, uptime time.Duration) time.Duration {
 }
 
 // runSession connects both endpoints and runs reconcile+IDLE until an error
-// or shutdown. Returning nil means clean shutdown.
+// or shutdown (nil).
 func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *slog.Logger, heartbeat *atomic.Int64) error {
 	src, err := imapx.Dial(m.Source)
 	if err != nil {
@@ -84,9 +84,7 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 	}
 	defer src.Close()
 
-	// Resolve special-use selectors (e.g. folder: \All) to the actual,
-	// possibly localized folder name (German Gmail: [Google Mail]/Alle
-	// Nachrichten).
+	// Resolve special-use selectors (e.g. \All) to the localized folder name.
 	srcFolder, err := src.ResolveSpecialUse()
 	if err != nil {
 		return err
@@ -110,21 +108,19 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 	}
 	defer dst.Close()
 
-	if err := dst.EnsureFolder(); err != nil {
-		return err
-	}
+	destFolders := []string{m.Dest.Folder}
 	if m.Archive.Enabled {
-		if err := dst.EnsureNamedFolder(m.Archive.Folder); err != nil {
-			return err
-		}
+		destFolders = append(destFolders, m.Archive.Folder)
 	}
 	if m.Sent.Enabled {
-		if err := dst.EnsureNamedFolder(m.Sent.Folder); err != nil {
+		destFolders = append(destFolders, m.Sent.Folder)
+	}
+	for _, f := range destFolders {
+		if err := dst.EnsureNamedFolder(f); err != nil {
 			return err
 		}
 	}
-	// Select the destination folder: guard and seeding search/fetch against
-	// it (re-selected on demand thereafter).
+	// Start with the destination folder selected (re-selected on demand later).
 	if _, _, _, err := dst.SelectFolder(); err != nil {
 		return err
 	}
@@ -132,39 +128,39 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 	// Heartbeat + throttled progress logging for long-running phases.
 	var lastProgressLog atomic.Int64
 	onProgress := func(phase, item string, processed int) {
-		heartbeat.Store(time.Now().Unix())
 		now := time.Now().Unix()
+		heartbeat.Store(now)
 		if last := lastProgressLog.Load(); now-last >= 30 && lastProgressLog.CompareAndSwap(last, now) {
+			args := []any{"phase", phase, "processed", processed}
 			if item != "" {
-				log.Info("progress", "phase", phase, "folder", item, "processed", processed)
-			} else {
-				log.Info("progress", "phase", phase, "processed", processed)
+				args = append(args, "folder", item)
 			}
+			log.Info("progress", args...)
 		}
 	}
 
 	rec := reconcile.New(store, src, dst, reconcile.Options{
-		UIDBatch:       m.UIDBatch,
-		DestGuard:      m.DestGuard,
-		CarrySeen:      m.CarrySeen,
-		SyncLabels:     m.Labels.Enabled,
-		SourceFolder:   srcFolder,
-		LabelExclude:   m.Labels.Exclude,
-		DestFolder:     m.Dest.Folder,
-		ArchiveRouting: m.Archive.Enabled,
-		SourceInbox:    m.Source.Inbox,
-		ArchiveFolder:  m.Archive.Folder,
-		SentRouting:    m.Sent.Enabled,
-		SentSrcFolder:  sentSrcFolder,
-		SentFolder:     m.Sent.Folder,
+		UIDBatch:           m.UIDBatch,
+		DestGuard:          m.DestGuard,
+		CarrySeen:          m.CarrySeen,
+		SyncLabels:         m.Labels.Enabled,
+		SourceFolder:       srcFolder,
+		LabelExclude:       m.Labels.Exclude,
+		DestFolder:         m.Dest.Folder,
+		ArchiveRouting:     m.Archive.Enabled,
+		SourceInbox:        m.Source.Inbox,
+		ArchiveFolder:      m.Archive.Folder,
+		SentRouting:        m.Sent.Enabled,
+		SentSrcFolder:      sentSrcFolder,
+		SentFolder:         m.Sent.Folder,
 		LabelPropagate:     m.Labels.Propagate,
 		KeywordPrefix:      m.Labels.KeywordPrefix,
 		KeywordReplacement: m.Labels.KeywordReplacement,
 		OnProgress:         onProgress,
 	}, log)
 
-	// Destination seeding: bootstrap the dedup set from what the destination
-	// already holds, so correctness never depends on local state.
+	// Bootstrap the dedup set from the destination, so correctness never
+	// depends on local state.
 	if err := maybeSeed(ctx, m, store, rec, log); err != nil {
 		return err
 	}
@@ -174,26 +170,20 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 		return err
 	}
 
-	// IDLE/poll loop. go-imap auto-restarts IDLE every ~28min; idle_reset is
-	// our own extra cap on one IDLE session, poll_interval the reconcile
-	// safety net. Any wake → stop IDLE → reconcile → re-IDLE.
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
+	// IDLE/poll loop: idle_reset caps one IDLE session, poll_interval is the
+	// reconcile safety net. Any wake: stop IDLE, reconcile, re-IDLE.
+	for ctx.Err() == nil {
 		idle, err := src.Idle()
 		if err != nil {
 			return err
 		}
 		wake := time.NewTimer(min(m.PollInterval, m.IdleReset))
-		var reason string
+		reason := "timer"
 		select {
 		case <-src.Notify():
 			reason = "idle-push"
 		case <-wake.C:
-			reason = "timer"
 		case <-ctx.Done():
-			reason = "shutdown"
 		}
 		wake.Stop()
 		heartbeat.Store(time.Now().Unix())
@@ -203,14 +193,15 @@ func runSession(ctx context.Context, m config.Mirror, store *state.Store, log *s
 		if err := idle.Wait(); err != nil {
 			return err
 		}
-		if reason == "shutdown" {
-			return nil
+		if ctx.Err() != nil {
+			break
 		}
 		log.Debug("reconcile triggered", "reason", reason)
 		if err := runReconcile(ctx, rec, log, heartbeat); err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
 func maybeSeed(ctx context.Context, m config.Mirror, store *state.Store, rec *reconcile.Reconciler, log *slog.Logger) error {
