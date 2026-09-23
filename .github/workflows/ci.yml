@@ -14,7 +14,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"; echo "$unformatted"; exit 1
+          fi
       - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
       - run: go test -race ./...
 
   docker:
@@ -47,5 +54,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: |
             GIT_SHA=${{ github.sha }}
