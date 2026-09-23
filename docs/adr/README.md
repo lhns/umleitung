@@ -4,6 +4,10 @@ Decisions made while designing and building Umleiter, in the order they were
 settled. Format: [Michael Nygard's ADR template](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 (Context / Decision / Consequences).
 
+ADRs are historical records. Environment variable names in 0002–0011
+(`SEED_DEST`, `DEST_FOLDER`, `SYNC_LABELS`, …) predate the YAML configuration
+of ADR 0012; the README has the old-name → YAML-key mapping.
+
 | # | Decision |
 |---|---|
 | [0001](0001-custom-go-mirror-not-mbsync-or-imapsync.md) | Custom Go mirror instead of mbsync or imapsync |
