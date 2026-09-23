@@ -1,14 +1,14 @@
-// Package imapx wraps go-imap/v2 with the handful of operations Umleiter
-// needs: IMAPS connect + LOGIN, SELECT, windowed header fetch, full fetch,
-// APPEND with INTERNALDATE, HEADER search, folder create, and IDLE.
+// Package imapx wraps go-imap/v2 with the operations Umleiter needs: LOGIN,
+// SELECT, LIST, header and full fetches, APPEND, Message-ID search, MOVE,
+// keyword STORE and IDLE.
 package imapx
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -23,9 +23,9 @@ import (
 // (and, on destination scans, for keyword backfill via Flags).
 type MsgMeta struct {
 	UID          imap.UID
-	MessageID    string // trimmed raw Message-ID header value; "" if absent
-	From         string // raw From header value (used only for key synthesis)
-	Subject      string // raw Subject header value (used only for key synthesis)
+	MessageID    string // trimmed Message-ID header value; "" if absent
+	From         string // raw From header value (key synthesis only)
+	Subject      string // raw Subject header value (key synthesis only)
 	InternalDate time.Time
 	Size         int64
 	Flags        []imap.Flag
@@ -45,27 +45,26 @@ type FolderInfo struct {
 	Attrs []imap.MailboxAttr
 }
 
-// Client is one IMAPS connection to a configured endpoint.
+// Client is one IMAP connection to a configured endpoint.
 type Client struct {
 	ep     config.Endpoint
 	c      *imapclient.Client
 	notify chan struct{}
 
-	// selected is the currently selected folder ("" = none yet); used to
-	// skip redundant SELECT round trips.
+	// selected is the currently selected folder ("" = none), to skip
+	// redundant SELECTs.
 	selected string
-	// guardChunk is the adaptive Message-ID batch size for guard searches
-	// (halved on server BAD responses; 0 = start at the default).
+	// guardChunk is the Message-ID batch size for guard searches, halved on
+	// server BAD responses.
 	guardChunk int
-	// arbitraryKeywords records whether the last SELECTed mailbox advertised
-	// PERMANENTFLAGS \* (arbitrary keywords storable).
+	// arbitraryKeywords: the last SELECTed folder advertised PERMANENTFLAGS \*.
 	arbitraryKeywords bool
 }
 
-// Dial connects with TLS, waits for the greeting and logs in with LOGIN.
-// Unilateral mailbox updates (EXISTS during IDLE) are surfaced on Notify().
+// Dial connects (TLS unless disabled) and logs in. Unilateral mailbox
+// updates (EXISTS during IDLE) are surfaced on Notify().
 func Dial(ep config.Endpoint) (*Client, error) {
-	cl := &Client{ep: ep, notify: make(chan struct{}, 1)}
+	cl := &Client{ep: ep, notify: make(chan struct{}, 1), guardChunk: defaultGuardChunk}
 	opts := &imapclient.Options{
 		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
 			Mailbox: func(data *imapclient.UnilateralDataMailbox) {
@@ -116,18 +115,15 @@ func (cl *Client) Close() {
 	_ = cl.c.Close()
 }
 
-// Notify delivers a signal whenever the server reports a mailbox change
-// (e.g. new mail while IDLE is running).
+// Notify signals whenever the server reports a mailbox size change.
 func (cl *Client) Notify() <-chan struct{} { return cl.notify }
 
-// SelectFolder selects the endpoint's folder and returns its UIDVALIDITY,
-// UIDNEXT and message count.
+// SelectFolder selects the endpoint's folder; see SelectNamedFolder.
 func (cl *Client) SelectFolder() (uidValidity uint32, uidNext uint32, numMessages uint32, err error) {
 	return cl.SelectNamedFolder(cl.ep.Folder)
 }
 
-// SelectNamedFolder selects an arbitrary folder (used by the membership scan
-// and multi-folder destinations) and returns its UIDVALIDITY, UIDNEXT and
+// SelectNamedFolder selects a folder and returns its UIDVALIDITY, UIDNEXT and
 // message count.
 func (cl *Client) SelectNamedFolder(name string) (uidValidity uint32, uidNext uint32, numMessages uint32, err error) {
 	data, err := cl.c.Select(name, nil).Wait()
@@ -149,8 +145,7 @@ func (cl *Client) ensureSelected(name string) error {
 	return err
 }
 
-// SearchAllUIDs returns every UID in the currently selected folder — a cheap
-// full-membership snapshot (UIDs only, no headers).
+// SearchAllUIDs returns every UID in the currently selected folder.
 func (cl *Client) SearchAllUIDs() ([]imap.UID, error) {
 	data, err := cl.c.UIDSearch(&imap.SearchCriteria{}, nil).Wait()
 	if err != nil {
@@ -160,18 +155,17 @@ func (cl *Client) SearchAllUIDs() ([]imap.UID, error) {
 }
 
 // SupportsArbitraryKeywords reports whether the most recently selected folder
-// advertised PERMANENTFLAGS \* (arbitrary keywords may be stored).
+// advertised PERMANENTFLAGS \*.
 func (cl *Client) SupportsArbitraryKeywords() bool { return cl.arbitraryKeywords }
 
-// ListFolders lists all folders on the server, with special-use attributes
-// when the server supports RFC 6154.
+// ListFolders lists all folders, with special-use attributes when the server
+// supports RFC 6154.
 func (cl *Client) ListFolders() ([]FolderInfo, error) {
 	var opts *imap.ListOptions
 	if cl.c.Caps().Has(imap.CapSpecialUse) {
 		opts = &imap.ListOptions{ReturnSpecialUse: true}
 	}
-	cmd := cl.c.List("", "*", opts)
-	data, err := cmd.Collect()
+	data, err := cl.c.List("", "*", opts).Collect()
 	if err != nil {
 		return nil, fmt.Errorf("list folders on %s: %w", cl.ep.Addr(), err)
 	}
@@ -182,10 +176,9 @@ func (cl *Client) ListFolders() ([]FolderInfo, error) {
 	return folders, nil
 }
 
-// ResolveFolder resolves a special-use folder selector (e.g. `\All`, `\Sent`
-// — RFC 6154) to the server's actual folder name, which providers localize
-// (German Gmail exposes All Mail as "[Google Mail]/Alle Nachrichten"). Plain
-// folder names pass through unchanged.
+// ResolveFolder resolves a special-use selector (e.g. `\All`, `\Sent`) to the
+// server's actual, possibly localized folder name ("[Google Mail]/Alle
+// Nachrichten"). Plain folder names pass through unchanged.
 func (cl *Client) ResolveFolder(nameOrSelector string) (string, error) {
 	if !strings.HasPrefix(nameOrSelector, `\`) {
 		return nameOrSelector, nil
@@ -214,7 +207,7 @@ func (cl *Client) ResolveSpecialUse() (string, error) {
 	return name, nil
 }
 
-// EnsureFolder creates the endpoint's default folder if it does not exist yet.
+// EnsureFolder creates the endpoint's folder if it does not exist yet.
 func (cl *Client) EnsureFolder() error { return cl.EnsureNamedFolder(cl.ep.Folder) }
 
 // EnsureNamedFolder creates the named folder if it does not exist yet.
@@ -223,8 +216,7 @@ func (cl *Client) EnsureNamedFolder(name string) error {
 	if err == nil {
 		return nil
 	}
-	// Treat "already exists" as success; servers phrase this differently, so
-	// double-check by selecting.
+	// Servers phrase "already exists" differently; check by selecting.
 	if _, _, _, selErr := cl.SelectNamedFolder(name); selErr == nil {
 		return nil
 	}
@@ -238,22 +230,20 @@ var metaSection = &imap.FetchItemBodySection{
 }
 
 // FetchMetaRange fetches MsgMeta for every existing message with
-// start <= UID <= stop, in one FETCH round trip, ascending by UID.
-// Non-existent UIDs in the range are simply absent from the result.
+// start <= UID <= stop in one round trip, ascending by UID.
 func (cl *Client) FetchMetaRange(start, stop imap.UID) ([]MsgMeta, error) {
 	return cl.fetchMetas(imap.UIDSet{imap.UIDRange{Start: start, Stop: stop}})
 }
 
 // fetchMetas fetches MsgMeta for an arbitrary UID set, ascending by UID.
 func (cl *Client) fetchMetas(uidSet imap.UIDSet) ([]MsgMeta, error) {
-	fetchOpts := &imap.FetchOptions{
+	cmd := cl.c.Fetch(uidSet, &imap.FetchOptions{
 		UID:          true,
 		InternalDate: true,
 		RFC822Size:   true,
 		Flags:        true,
 		BodySection:  []*imap.FetchItemBodySection{metaSection},
-	}
-	cmd := cl.c.Fetch(uidSet, fetchOpts)
+	})
 	var metas []MsgMeta
 	for {
 		msg := cmd.Next()
@@ -265,8 +255,7 @@ func (cl *Client) fetchMetas(uidSet imap.UIDSet) ([]MsgMeta, error) {
 			cmd.Close()
 			return nil, fmt.Errorf("fetch metas: %w", err)
 		}
-		hdr := buf.FindBodySection(metaSection)
-		mid, from, subject := parseMetaHeader(hdr)
+		mid, from, subject := parseMetaHeader(buf.FindBodySection(metaSection))
 		metas = append(metas, MsgMeta{
 			UID:          buf.UID,
 			MessageID:    mid,
@@ -280,23 +269,19 @@ func (cl *Client) fetchMetas(uidSet imap.UIDSet) ([]MsgMeta, error) {
 	if err := cmd.Close(); err != nil {
 		return nil, fmt.Errorf("fetch metas: %w", err)
 	}
-	// Servers may return any order; sort ascending so the caller's
-	// high-water-mark logic is correct.
-	sortMetas(metas)
+	// Servers may return any order; callers' high-water marks need ascending.
+	slices.SortFunc(metas, func(a, b MsgMeta) int { return cmp.Compare(a.UID, b.UID) })
 	return metas, nil
 }
 
-// guardChunk is the initial Message-ID count per SEARCH command; servers
-// with stricter filter limits shrink it adaptively (see SearchMessageIDsIn).
-const guardChunk = 100
+// defaultGuardChunk is the initial Message-ID count per guard SEARCH.
+const defaultGuardChunk = 100
 
 // SearchMessageIDsIn reports which of the given Message-IDs exist in the
-// named folder. Batched: one `UID SEARCH` per chunk (an OR-tree of HEADER
-// criteria); only chunks with hits cost an extra header fetch to identify
-// which ids matched. If the server rejects a chunk with BAD (filter-depth /
-// complexity limits vary per implementation), the chunk size is halved and
-// remembered for the rest of the session — self-tuning down to single-id
-// searches in the worst case.
+// named folder. One UID SEARCH per chunk (an OR-tree of HEADER criteria);
+// only chunks with hits cost a header fetch to identify the matches. A BAD
+// response (server filter limits vary) halves the chunk size for the rest of
+// the session, down to single-id searches.
 func (cl *Client) SearchMessageIDsIn(folder string, ids []string) (map[string]bool, error) {
 	found := map[string]bool{}
 	if len(ids) == 0 {
@@ -304,9 +289,6 @@ func (cl *Client) SearchMessageIDsIn(folder string, ids []string) (map[string]bo
 	}
 	if err := cl.ensureSelected(folder); err != nil {
 		return nil, err
-	}
-	if cl.guardChunk == 0 {
-		cl.guardChunk = guardChunk
 	}
 	for i := 0; i < len(ids); {
 		end := min(i+cl.guardChunk, len(ids))
@@ -336,17 +318,15 @@ func (cl *Client) SearchMessageIDsIn(folder string, ids []string) (map[string]bo
 	return found, nil
 }
 
-// isBadResponse reports whether err is a tagged BAD from the server (the
-// server understood the command but rejected its complexity/arguments).
+// isBadResponse reports whether err is a tagged BAD from the server.
 func isBadResponse(err error) bool {
 	var imapErr *imap.Error
 	return errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeBad
 }
 
-// orMessageIDCriteria builds `OR ... OR HEADER Message-Id x ...` as a
-// BALANCED OR-pair tree: servers cap filter nesting depth (Stalwart rejects
-// deep chains with "BAD Too many nested filters"), and a balanced tree keeps
-// depth at log2(N) — 7 levels for a 100-id chunk instead of 99.
+// orMessageIDCriteria builds `OR ... HEADER Message-Id x ...` as a balanced
+// OR tree: servers cap filter nesting depth (Stalwart: "BAD Too many nested
+// filters"), and a balanced tree keeps depth at log2(N).
 func orMessageIDCriteria(ids []string) *imap.SearchCriteria {
 	if len(ids) == 1 {
 		return &imap.SearchCriteria{
@@ -359,60 +339,39 @@ func orMessageIDCriteria(ids []string) *imap.SearchCriteria {
 	}
 }
 
-// FetchFull fetches the complete raw message, flags and INTERNALDATE for one UID.
+var fullSection = &imap.FetchItemBodySection{Peek: true} // BODY.PEEK[]
+
+// FetchFull fetches the complete message for one UID.
 func (cl *Client) FetchFull(uid imap.UID) (*FullMessage, error) {
-	bodySection := &imap.FetchItemBodySection{Peek: true} // BODY.PEEK[] = whole message
-	fetchOpts := &imap.FetchOptions{
-		UID:          true,
-		Flags:        true,
-		InternalDate: true,
-		BodySection:  []*imap.FetchItemBodySection{bodySection},
-	}
-	cmd := cl.c.Fetch(imap.UIDSetNum(uid), fetchOpts)
-	defer cmd.Close()
 	var full *FullMessage
-	for {
-		msg := cmd.Next()
-		if msg == nil {
-			break
+	err := cl.FetchFullStream([]imap.UID{uid}, func(m *FullMessage) error {
+		if m.UID == uid {
+			full = m
 		}
-		buf, err := msg.Collect()
-		if err != nil {
-			return nil, fmt.Errorf("fetch full uid %d: %w", uid, err)
-		}
-		if buf.UID != uid {
-			continue
-		}
-		full = &FullMessage{
-			Raw:          buf.FindBodySection(bodySection),
-			Flags:        buf.Flags,
-			InternalDate: buf.InternalDate,
-		}
-	}
-	if err := cmd.Close(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("fetch full uid %d: %w", uid, err)
 	}
-	if full == nil || len(full.Raw) == 0 {
+	if full == nil {
 		return nil, fmt.Errorf("fetch full uid %d: message vanished or empty", uid)
 	}
 	return full, nil
 }
 
-// FetchFullStream fetches complete messages for the given UIDs in ONE FETCH
-// command, invoking fn per message as bodies stream in (bounded memory: one
-// message buffered at a time). fn returning an error aborts the stream.
+// FetchFullStream fetches complete messages for the given UIDs in one FETCH,
+// calling fn per message as it arrives (one body in memory at a time). An
+// error from fn aborts the stream.
 func (cl *Client) FetchFullStream(uids []imap.UID, fn func(*FullMessage) error) error {
 	if len(uids) == 0 {
 		return nil
 	}
-	bodySection := &imap.FetchItemBodySection{Peek: true} // BODY.PEEK[] = whole message
-	fetchOpts := &imap.FetchOptions{
+	cmd := cl.c.Fetch(imap.UIDSetNum(uids...), &imap.FetchOptions{
 		UID:          true,
 		Flags:        true,
 		InternalDate: true,
-		BodySection:  []*imap.FetchItemBodySection{bodySection},
-	}
-	cmd := cl.c.Fetch(imap.UIDSetNum(uids...), fetchOpts)
+		BodySection:  []*imap.FetchItemBodySection{fullSection},
+	})
 	for {
 		msg := cmd.Next()
 		if msg == nil {
@@ -423,7 +382,7 @@ func (cl *Client) FetchFullStream(uids []imap.UID, fn func(*FullMessage) error) 
 			cmd.Close()
 			return fmt.Errorf("fetch full stream: %w", err)
 		}
-		raw := buf.FindBodySection(bodySection)
+		raw := buf.FindBodySection(fullSection)
 		if len(raw) == 0 {
 			continue // vanished mid-fetch; next reconcile retries
 		}
@@ -443,14 +402,7 @@ func (cl *Client) FetchFullStream(uids []imap.UID, fn func(*FullMessage) error) 
 	return nil
 }
 
-// HasMessageID searches the currently selected folder for a Message-ID
-// header value.
-func (cl *Client) HasMessageID(messageID string) (bool, error) {
-	uids, err := cl.searchMessageIDUIDs(messageID)
-	return len(uids) > 0, err
-}
-
-// Append appends a raw message to the endpoint's default folder.
+// Append appends a message to the endpoint's folder.
 func (cl *Client) Append(msg *FullMessage, flags []imap.Flag) error {
 	return cl.AppendTo(cl.ep.Folder, msg, flags)
 }
@@ -474,9 +426,8 @@ func (p *pendingAppend) Wait() error {
 	return nil
 }
 
-// BeginAppend issues an APPEND (command + literal fully written) and returns
-// without waiting for the tagged response, enabling pipelined appends —
-// go-imap's client is async, so several appends can be in flight at once.
+// BeginAppend writes an APPEND (command + literal) without waiting for the
+// tagged response, so several appends can be pipelined.
 func (cl *Client) BeginAppend(folder string, msg *FullMessage, flags []imap.Flag) (PendingAppend, error) {
 	opts := &imap.AppendOptions{Flags: flags}
 	if !msg.InternalDate.IsZero() {
@@ -493,8 +444,8 @@ func (cl *Client) BeginAppend(folder string, msg *FullMessage, flags []imap.Flag
 	return &pendingAppend{cmd: cmd, folder: folder, addr: cl.ep.Addr()}, nil
 }
 
-// AppendTo appends a raw message to the named folder, preserving
-// INTERNALDATE and the given flags. Returns only after the server confirms.
+// AppendTo appends a message to the named folder, preserving INTERNALDATE,
+// and waits for the server's confirmation.
 func (cl *Client) AppendTo(folder string, msg *FullMessage, flags []imap.Flag) error {
 	p, err := cl.BeginAppend(folder, msg, flags)
 	if err != nil {
@@ -503,9 +454,12 @@ func (cl *Client) AppendTo(folder string, msg *FullMessage, flags []imap.Flag) e
 	return p.Wait()
 }
 
-// searchMessageIDUIDs returns the UIDs matching a Message-ID header in the
-// currently selected folder.
-func (cl *Client) searchMessageIDUIDs(messageID string) ([]imap.UID, error) {
+// searchMessageID selects folder and returns the UIDs whose Message-ID
+// header matches.
+func (cl *Client) searchMessageID(folder, messageID string) ([]imap.UID, error) {
+	if err := cl.ensureSelected(folder); err != nil {
+		return nil, err
+	}
 	criteria := &imap.SearchCriteria{
 		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: messageID}},
 	}
@@ -516,30 +470,13 @@ func (cl *Client) searchMessageIDUIDs(messageID string) ([]imap.UID, error) {
 	return data.AllUIDs(), nil
 }
 
-// HasMessageIDIn searches the named folder for a Message-ID header value.
-func (cl *Client) HasMessageIDIn(folder, messageID string) (bool, error) {
-	if err := cl.ensureSelected(folder); err != nil {
-		return false, err
-	}
-	uids, err := cl.searchMessageIDUIDs(messageID)
-	return len(uids) > 0, err
-}
-
-// MoveMessageID moves the message with the given Message-ID from one folder
-// to another. Returns (false, nil) when the message is not in fromFolder —
-// e.g. manually refiled by the user — which callers treat as "nothing to do".
-// go-imap falls back to COPY + STORE \Deleted + EXPUNGE on servers without
-// the MOVE capability.
+// MoveMessageID moves the message with the given Message-ID between folders.
+// Returns (false, nil) when it is not in fromFolder (e.g. refiled by the
+// user). Falls back to COPY + STORE \Deleted + EXPUNGE without MOVE support.
 func (cl *Client) MoveMessageID(fromFolder, toFolder, messageID string) (bool, error) {
-	if err := cl.ensureSelected(fromFolder); err != nil {
+	uids, err := cl.searchMessageID(fromFolder, messageID)
+	if err != nil || len(uids) == 0 {
 		return false, err
-	}
-	uids, err := cl.searchMessageIDUIDs(messageID)
-	if err != nil {
-		return false, err
-	}
-	if len(uids) == 0 {
-		return false, nil
 	}
 	if _, err := cl.c.Move(imap.UIDSetNum(uids...), toFolder).Wait(); err != nil {
 		return false, fmt.Errorf("move %q -> %q on %s: %w", fromFolder, toFolder, cl.ep.Addr(), err)
@@ -547,8 +484,8 @@ func (cl *Client) MoveMessageID(fromFolder, toFolder, messageID string) (bool, e
 	return true, nil
 }
 
-// MoveUIDs batch-moves messages by UID from one folder to another. Used by
-// the placement backfill; chunking is the caller's concern.
+// MoveUIDs moves messages by UID between folders; chunking is the caller's
+// concern.
 func (cl *Client) MoveUIDs(fromFolder string, uids []imap.UID, toFolder string) error {
 	if len(uids) == 0 {
 		return nil
@@ -563,74 +500,58 @@ func (cl *Client) MoveUIDs(fromFolder string, uids []imap.UID, toFolder string) 
 	return nil
 }
 
-// StoreKeywordByMessageID adds or removes a keyword flag on the message with
-// the given Message-ID in the named folder. Returns (false, nil) when the
-// message is not found there. Idempotent (±FLAGS.SILENT).
+// StoreKeywordByMessageID adds or removes a keyword on the message with the
+// given Message-ID in folder. Returns (false, nil) when it is not there.
 func (cl *Client) StoreKeywordByMessageID(folder, messageID string, add bool, kw imap.Flag) (bool, error) {
-	if err := cl.ensureSelected(folder); err != nil {
+	uids, err := cl.searchMessageID(folder, messageID)
+	if err != nil || len(uids) == 0 {
 		return false, err
-	}
-	uids, err := cl.searchMessageIDUIDs(messageID)
-	if err != nil {
-		return false, err
-	}
-	if len(uids) == 0 {
-		return false, nil
 	}
 	op := imap.StoreFlagsAdd
 	if !add {
 		op = imap.StoreFlagsDel
 	}
-	cmd := cl.c.Store(imap.UIDSetNum(uids...), &imap.StoreFlags{
-		Op: op, Silent: true, Flags: []imap.Flag{kw},
-	}, nil)
-	if err := cmd.Close(); err != nil {
-		return false, fmt.Errorf("store keyword on %s: %w", cl.ep.Addr(), err)
+	if err := cl.storeFlags(uids, op, []imap.Flag{kw}); err != nil {
+		return false, err
 	}
 	return true, nil
 }
 
-// StoreKeywordsUIDs batch-adds keyword flags to messages by UID in the
-// currently selected folder (keyword backfill).
+// StoreKeywordsUIDs adds keywords to messages by UID in the currently
+// selected folder.
 func (cl *Client) StoreKeywordsUIDs(uids []imap.UID, kws []imap.Flag) error {
 	if len(uids) == 0 || len(kws) == 0 {
 		return nil
 	}
-	cmd := cl.c.Store(imap.UIDSetNum(uids...), &imap.StoreFlags{
-		Op: imap.StoreFlagsAdd, Silent: true, Flags: kws,
-	}, nil)
+	return cl.storeFlags(uids, imap.StoreFlagsAdd, kws)
+}
+
+func (cl *Client) storeFlags(uids []imap.UID, op imap.StoreFlagsOp, flags []imap.Flag) error {
+	cmd := cl.c.Store(imap.UIDSetNum(uids...), &imap.StoreFlags{Op: op, Silent: true, Flags: flags}, nil)
 	if err := cmd.Close(); err != nil {
 		return fmt.Errorf("store keywords on %s: %w", cl.ep.Addr(), err)
 	}
 	return nil
 }
 
-// Idle starts IDLE on the currently selected folder. go-imap restarts the
-// underlying IDLE command every ~28 minutes on its own; the caller stops it
-// via Close() when it wants to run a reconcile.
+// Idle starts IDLE on the currently selected folder; stop it with Close().
+// go-imap restarts the underlying command every ~28 minutes.
 func (cl *Client) Idle() (*imapclient.IdleCommand, error) {
 	return cl.c.Idle()
 }
 
-// parseMetaHeader extracts the raw Message-ID, From and Subject values from a
-// HEADER.FIELDS response using go-message.
+// parseMetaHeader extracts the trimmed Message-ID, From and Subject values
+// from a HEADER.FIELDS response.
 func parseMetaHeader(hdr []byte) (messageID, from, subject string) {
 	if len(hdr) == 0 {
 		return "", "", ""
 	}
-	// message.Read may return a non-fatal error (e.g. unknown charset) while
-	// still yielding a usable entity; only bail if we got no entity at all.
+	// message.Read may return a non-fatal error (e.g. unknown charset) along
+	// with a usable entity; only bail without one.
 	ent, _ := message.Read(bytes.NewReader(append(hdr, '\r', '\n')))
 	if ent == nil {
 		return "", "", ""
 	}
 	h := ent.Header
-	messageID = strings.TrimSpace(h.Get("Message-Id"))
-	from = strings.TrimSpace(h.Get("From"))
-	subject = strings.TrimSpace(h.Get("Subject"))
-	return messageID, from, subject
-}
-
-func sortMetas(metas []MsgMeta) {
-	sort.Slice(metas, func(i, j int) bool { return metas[i].UID < metas[j].UID })
+	return strings.TrimSpace(h.Get("Message-Id")), strings.TrimSpace(h.Get("From")), strings.TrimSpace(h.Get("Subject"))
 }
