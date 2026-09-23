@@ -7,17 +7,12 @@ import (
 	"testing"
 )
 
-// buildLegacyDB creates a database exactly as the pre-migration deployed
-// version did: schema via CREATE TABLE IF NOT EXISTS, no user_version ever
-// set (reads as 0), with realistic data.
-func buildLegacyDB(t *testing.T, path string) {
-	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	legacySchema := `
+// legacySchema builds a database exactly as the pre-migration deployed
+// version did: CREATE TABLE IF NOT EXISTS, no user_version ever set (reads
+// as 0), with realistic data. One transaction: autocommitting each
+// statement would cost an fsync apiece.
+const legacySchema = `
+BEGIN;
 CREATE TABLE IF NOT EXISTS copied (
 	message_id TEXT PRIMARY KEY,
 	uid        INTEGER NOT NULL DEFAULT 0,
@@ -41,19 +36,23 @@ INSERT INTO copied VALUES ('<a@x>', 10, 1000), ('<b@x>', 20, 2000);
 INSERT INTO meta VALUES ('uidvalidity', '42'), ('last_uid', '20');
 INSERT INTO labels VALUES ('<a@x>', 'Work'), ('<a@x>', 'Friends/Close'), ('<b@x>', 'Work');
 INSERT INTO folders VALUES ('Work', 7, 5), ('Friends/Close', 8, 3);
+COMMIT;
 `
-	if _, err := db.Exec(legacySchema); err != nil {
-		t.Fatal(err)
-	}
-}
 
-func userVersion(t *testing.T, path string) int {
+func buildLegacyDB(t *testing.T, path string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(legacySchema); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func userVersion(t *testing.T, db *sql.DB) int {
+	t.Helper()
 	var v int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
@@ -62,17 +61,15 @@ func userVersion(t *testing.T, path string) int {
 }
 
 func TestMigrateLegacyDBWithoutVersioning(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "state.db")
 	buildLegacyDB(t, path)
-	if v := userVersion(t, path); v != 0 {
-		t.Fatalf("legacy db user_version = %d, want 0 (no migration system)", v)
-	}
 
 	s, err := Open(path)
 	if err != nil {
 		t.Fatalf("upgrade from legacy db failed: %v", err)
 	}
-	defer s.Close()
+	defer func() { s.Close() }()
 
 	// Dedup state preserved.
 	if has, _ := s.HasKey("<a@x>"); !has {
@@ -109,36 +106,60 @@ func TestMigrateLegacyDBWithoutVersioning(t *testing.T) {
 	if v, u, _ := s.FolderState("Work"); v != 0 || u != 0 {
 		t.Fatalf("folders not cleared: (%d, %d)", v, u)
 	}
+
+	// Reopening an up-to-date db is a no-op.
+	s.Close()
+	if s, err = Open(path); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if v := userVersion(t, s.db); v != schemaVersion {
+		t.Fatalf("version = %d, want %d", v, schemaVersion)
+	}
+	if n, _ := s.CopiedCount(); n != 2 {
+		t.Fatalf("copied count after reopen = %d, want 2", n)
+	}
 }
 
 func TestMigrateFreshDB(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-	if v := userVersion(t, path); v != schemaVersion {
+	t.Parallel()
+	s := openMem(t)
+	if v := userVersion(t, s.db); v != schemaVersion {
 		t.Fatalf("fresh db version = %d, want %d", v, schemaVersion)
 	}
 }
 
-func TestMigrateIsIdempotentAcrossReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.db")
-	buildLegacyDB(t, path)
-	for i := range 3 {
-		s, err := Open(path)
-		if err != nil {
-			t.Fatalf("reopen %d: %v", i, err)
-		}
-		s.Close()
+// A failing migration step must leave the db at its previous version with
+// no partial schema changes.
+func TestFailedMigrationRollsBack(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if v := userVersion(t, path); v != schemaVersion {
-		t.Fatalf("version = %d, want %d", v, schemaVersion)
+	defer db.Close()
+	db.SetMaxOpenConns(1) // one connection = one in-memory db
+	// v1 with a conflicting `pending` table: v1 -> v2 fails after it has
+	// already created `members`.
+	if _, err := db.Exec(legacySchema + `PRAGMA user_version = 1; CREATE TABLE pending (x);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err == nil {
+		t.Fatal("migration succeeded despite conflicting table")
+	}
+	if v := userVersion(t, db); v != 1 {
+		t.Fatalf("version = %d after failed migration, want 1", v)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name IN ('members', 'labels')`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 { // labels kept, members not created
+		t.Fatalf("partial migration left behind: %d of members/labels exist, want only labels", n)
 	}
 }
 
 func TestRefuseNewerSchema(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "state.db")
 	db, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
