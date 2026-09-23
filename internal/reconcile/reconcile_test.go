@@ -41,7 +41,7 @@ func newFakeStore() *fakeStore {
 	}
 }
 
-func (s *fakeStore) UIDValidity() (uint32, error)  { return s.uidValidity, nil }
+func (s *fakeStore) UIDValidity() (uint32, error) { return s.uidValidity, nil }
 func (s *fakeStore) SetUIDValidity(v uint32) error {
 	if s.failSetUIDValidity {
 		return fmt.Errorf("set uidvalidity failed (injected)")
@@ -310,8 +310,9 @@ type fakeDest struct {
 	appendedTo     []string      // folder per append
 	moves          int
 	appendErr      error
-	failAppendAt   int // fail the Nth append (1-based; 0 = never)
+	failAppendAt   int  // fail the Nth append (1-based; 0 = never)
 	rejectKeywords bool // reject any APPEND carrying non-\Seen flags
+	failPlain      bool // fail any APPEND without keywords (the fallback retry)
 	noArbitraryKw  bool
 	selected       string
 	guardSearches  int // SearchMessageIDsIn call count
@@ -404,13 +405,13 @@ func (d *fakeDest) AppendTo(folder string, msg *imapx.FullMessage, flags []imap.
 	if d.failAppendAt > 0 && len(d.appended)+1 == d.failAppendAt {
 		return fmt.Errorf("append %d failed (injected)", d.failAppendAt)
 	}
-	if d.rejectKeywords {
-		for _, f := range flags {
-			if f != imap.FlagSeen {
-				// A tagged server rejection (definitely not stored).
-				return &imap.Error{Type: imap.StatusResponseTypeNo, Text: fmt.Sprintf("keyword %q not permitted (injected)", f)}
-			}
-		}
+	hasKeyword := slices.ContainsFunc(flags, func(f imap.Flag) bool { return f != imap.FlagSeen })
+	if d.rejectKeywords && hasKeyword {
+		// A tagged server rejection (definitely not stored).
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "keyword not permitted (injected)"}
+	}
+	if d.failPlain && !hasKeyword {
+		return fmt.Errorf("plain append failed (injected)")
 	}
 	d.nextUID[folder]++
 	// Extract Message-ID from the raw body if the test encoded one (tests use
@@ -510,6 +511,32 @@ func msg(uid uint32, mid, raw string) fakeMsg {
 		raw: raw,
 	}
 }
+
+// seqMsgs returns n messages with UIDs 1..n, Message-IDs <prefix{i}@x> and
+// raw bodies raw-prefix{i}.
+func seqMsgs(prefix string, n int) []fakeMsg {
+	var out []fakeMsg
+	for i := 1; i <= n; i++ {
+		out = append(out, msg(uint32(i), fmt.Sprintf("<%s%d@x>", prefix, i), fmt.Sprintf("raw-%s%d", prefix, i)))
+	}
+	return out
+}
+
+// workSource: one message (uid 1) in the main folder, also labeled "Work"
+// when labeled is set.
+func workSource(mid, raw string, labeled bool) *fakeSource {
+	var work []fakeMsg
+	if labeled {
+		work = []fakeMsg{msg(1, mid, raw)}
+	}
+	return &fakeSource{
+		uidValidity:  7,
+		msgs:         []fakeMsg{msg(1, mid, raw)},
+		labelFolders: map[string]*fakeLabelFolder{"Work": {uidValidity: 71, msgs: work}},
+	}
+}
+
+func labelOpts() Options { return Options{SyncLabels: true, SourceFolder: fakeMainFolder} }
 
 func newRec(store Store, src Source, dst Dest, opts Options) *Reconciler {
 	if opts.DestFolder == "" {
@@ -666,11 +693,7 @@ func TestAppendFailureLeavesKeyUnrecorded(t *testing.T) {
 func TestWindowedResumeAfterMidRunFailure(t *testing.T) {
 	// 6 messages, window size 2 → 3 windows; connection dies after window 2.
 	store := newFakeStore()
-	var msgs []fakeMsg
-	for i := uint32(1); i <= 6; i++ {
-		msgs = append(msgs, msg(i, fmt.Sprintf("<m%d@x>", i), fmt.Sprintf("raw-%d", i)))
-	}
-	src := &fakeSource{uidValidity: 7, msgs: msgs, failAfter: 2}
+	src := &fakeSource{uidValidity: 7, msgs: seqMsgs("m", 6), failAfter: 2}
 	dst := newFakeDest()
 	rec := newRec(store, src, dst, Options{UIDBatch: 2})
 
@@ -732,11 +755,7 @@ func TestSeedFromDestPreventsRecopy(t *testing.T) {
 // per message — while still catching every pre-existing message.
 func TestGuardIsBatchedPerWindow(t *testing.T) {
 	store := newFakeStore()
-	var msgs []fakeMsg
-	for i := uint32(1); i <= 5; i++ {
-		msgs = append(msgs, msg(i, fmt.Sprintf("<g%d@x>", i), fmt.Sprintf("raw-g%d", i)))
-	}
-	src := &fakeSource{uidValidity: 7, msgs: msgs}
+	src := &fakeSource{uidValidity: 7, msgs: seqMsgs("g", 5)}
 	dst := newFakeDest()
 	dst.addExisting(fakeDestFolder, "<g3@x>", "raw-g3-preexisting")
 	rec := newRec(store, src, dst, Options{DestGuard: true, UIDBatch: 100})
@@ -781,11 +800,7 @@ func TestGuardExcludesSynthesizedKeys(t *testing.T) {
 // aborts the pass with already-appended messages recorded (resume-safe).
 func TestPipelineOrderAndMidStreamFailure(t *testing.T) {
 	store := newFakeStore()
-	var msgs []fakeMsg
-	for i := uint32(1); i <= 6; i++ {
-		msgs = append(msgs, msg(i, fmt.Sprintf("<s%d@x>", i), fmt.Sprintf("raw-s%d", i)))
-	}
-	src := &fakeSource{uidValidity: 7, msgs: msgs}
+	src := &fakeSource{uidValidity: 7, msgs: seqMsgs("s", 6)}
 	dst := newFakeDest()
 	dst.failAppendAt = 4 // 4th append errors
 	rec := newRec(store, src, dst, Options{UIDBatch: 100})
@@ -825,11 +840,7 @@ func TestPipelineOrderAndMidStreamFailure(t *testing.T) {
 // (multiple flushes + final flush), order preserved through the append ring.
 func TestRecordBatchingAcrossFlushes(t *testing.T) {
 	store := newFakeStore()
-	var msgs []fakeMsg
-	for i := uint32(1); i <= 120; i++ { // > 2x recordFlushSize
-		msgs = append(msgs, msg(i, fmt.Sprintf("<b%d@x>", i), fmt.Sprintf("raw-b%d", i)))
-	}
-	src := &fakeSource{uidValidity: 7, msgs: msgs}
+	src := &fakeSource{uidValidity: 7, msgs: seqMsgs("b", 120)}
 	dst := newFakeDest()
 	rec := newRec(store, src, dst, Options{UIDBatch: 1000})
 
@@ -855,11 +866,7 @@ func TestRecordBatchingAcrossFlushes(t *testing.T) {
 
 func TestOnProgressCalledPerWindow(t *testing.T) {
 	store := newFakeStore()
-	var msgs []fakeMsg
-	for i := uint32(1); i <= 6; i++ {
-		msgs = append(msgs, msg(i, fmt.Sprintf("<p%d@x>", i), fmt.Sprintf("raw-p%d", i)))
-	}
-	src := &fakeSource{uidValidity: 7, msgs: msgs}
+	src := &fakeSource{uidValidity: 7, msgs: seqMsgs("p", 6)}
 	dst := newFakeDest()
 	var calls int
 	rec := newRec(store, src, dst, Options{
