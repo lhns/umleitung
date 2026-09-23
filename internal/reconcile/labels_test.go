@@ -14,23 +14,23 @@ import (
 func TestKeywordForSanitization(t *testing.T) {
 	cases := []struct{ label, repl, want string }{
 		{"Work", "_", "work"},
-		{"[Werbung]", "_", "werbung"},          // brackets trimmed
-		{"Werbung", "_", "werbung"},            // collides with the above
-		{"Bücher", "_", "b_cher"},              // umlaut
+		{"[Werbung]", "_", "werbung"}, // brackets trimmed
+		{"Werbung", "_", "werbung"},   // collides with the above
+		{"Bücher", "_", "b_cher"},     // umlaut
 		{"Wichtige Mails", "_", "wichtige_mails"},
 		{"Work/Projects", "_", "work_projects"}, // hierarchy delimiter
 		{"$Important", "_", "important"},
 		{`\Seen`, "_", "seen"},
-		{"a  b//c", "_", "a_b_c"},               // runs collapsed
-		{"---", "_", "---"},                     // dashes kept literally
-		{"...", "_", ""},                        // nothing survives -> skip
+		{"a  b//c", "_", "a_b_c"}, // runs collapsed
+		{"---", "_", "---"},       // dashes kept literally
+		{"...", "_", ""},          // nothing survives -> skip
 		{"", "_", ""},
 		// Dash replacement (Bulwark convention).
 		{"Wichtige Mails", "-", "wichtige-mails"},
 		{"Work/Projects", "-", "work-projects"},
 		{"Bücher", "-", "b-cher"},
-		{"a  b//c", "-", "a-b-c"},               // runs collapsed to one dash
-		{"Work_Sub", "-", "work_sub"},           // underscore kept literally
+		{"a  b//c", "-", "a-b-c"},     // runs collapsed to one dash
+		{"Work_Sub", "-", "work_sub"}, // underscore kept literally
 	}
 	for _, c := range cases {
 		if got := keywordFor(c.label, c.repl); got != c.want {
@@ -66,10 +66,10 @@ func TestLabelFolderExclusion(t *testing.T) {
 	}{
 		{imapx.FolderInfo{Name: "Work"}, true},
 		{imapx.FolderInfo{Name: "Friends/Close"}, true},
-		{imapx.FolderInfo{Name: "AllMail"}, false},  // source folder
-		{imapx.FolderInfo{Name: "INBOX"}, false},    // inbox membership is not a label
-		{imapx.FolderInfo{Name: "inbox"}, false},    // case-insensitive
-		{imapx.FolderInfo{Name: "Skipped"}, false},  // LABEL_EXCLUDE
+		{imapx.FolderInfo{Name: "AllMail"}, false}, // source folder
+		{imapx.FolderInfo{Name: "INBOX"}, false},   // inbox membership is not a label
+		{imapx.FolderInfo{Name: "inbox"}, false},   // case-insensitive
+		{imapx.FolderInfo{Name: "Skipped"}, false}, // LABEL_EXCLUDE
 		{imapx.FolderInfo{Name: "Parent", Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect}}, false},
 		{imapx.FolderInfo{Name: "Sent", Attrs: []imap.MailboxAttr{imap.MailboxAttrSent}}, false},
 		{imapx.FolderInfo{Name: "Trash", Attrs: []imap.MailboxAttr{imap.MailboxAttrTrash}}, false},
@@ -101,7 +101,7 @@ func TestMirrorAppendsLabelKeywords(t *testing.T) {
 		},
 	}
 	dst := newFakeDest()
-	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	rec := newRec(store, src, dst, labelOpts())
 
 	sum, err := rec.Run(context.Background())
 	if err != nil {
@@ -120,15 +120,9 @@ func TestMirrorAppendsLabelKeywords(t *testing.T) {
 
 func TestLabelScanResumable(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
-		},
-	}
+	src := workSource("<a@x>", "raw-a", true)
 	dst := newFakeDest()
-	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	rec := newRec(store, src, dst, labelOpts())
 	if _, err := rec.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -162,17 +156,11 @@ func TestLabelScanResumable(t *testing.T) {
 
 func TestKeywordAppendFallback(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
-		},
-	}
+	src := workSource("<a@x>", "raw-a", true)
 	dst := newFakeDest()
 	dst.rejectKeywords = true
 	dst.noArbitraryKw = true // also exercises the warning path
-	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	rec := newRec(store, src, dst, labelOpts())
 
 	sum, err := rec.Run(context.Background())
 	if err != nil {
@@ -202,15 +190,9 @@ func TestKeywordAppendFallback(t *testing.T) {
 
 func TestKeywordAppendNoRetryWhenAccepted(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
-		},
-	}
+	src := workSource("<a@x>", "raw-a", true)
 	dst := newFakeDest()
-	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	rec := newRec(store, src, dst, labelOpts())
 	if _, err := rec.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -227,16 +209,10 @@ func TestKeywordAppendNoRetryWhenAccepted(t *testing.T) {
 // duplicate. The pass aborts; the destination guard reconciles next run.
 func TestKeywordRetryOnlyOnServerReject(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
-		},
-	}
+	src := workSource("<a@x>", "raw-a", true)
 	dst := newFakeDest()
 	dst.appendErr = fmt.Errorf("connection reset (injected)") // NOT a tagged server response
-	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	rec := newRec(store, src, dst, labelOpts())
 
 	if _, err := rec.Run(context.Background()); err == nil {
 		t.Fatal("want pass abort on connection-level append error")
@@ -274,25 +250,54 @@ func TestGuardOffDegradesToSynchronousRecords(t *testing.T) {
 	}
 }
 
-// Guard: a failing append with keywords where the retry ALSO fails must
-// surface the error and leave the key unrecorded (retryable).
+// A keyword rejection whose keyword-less retry ALSO fails must surface the
+// error and leave the key unrecorded (retryable).
 func TestKeywordAppendFallbackBothFail(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<a@x>", "raw-a")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}},
-		},
-	}
+	src := workSource("<a@x>", "raw-a", true)
 	dst := newFakeDest()
-	dst.appendErr = fmt.Errorf("append always fails (injected)")
-	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	dst.rejectKeywords = true
+	dst.failPlain = true
+	rec := newRec(store, src, dst, labelOpts())
 
 	if _, err := rec.Run(context.Background()); err == nil {
 		t.Fatal("want error when both appends fail")
 	}
 	if store.keys["<a@x>"] {
 		t.Fatal("key recorded despite total append failure")
+	}
+}
+
+func TestLabelExcludeOption(t *testing.T) {
+	store := newFakeStore()
+	src := workSource("<a@x>", "raw-a", true)
+	src.labelFolders["Skip"] = &fakeLabelFolder{uidValidity: 72, msgs: []fakeMsg{msg(1, "<a@x>", "raw-a")}}
+	dst := newFakeDest()
+	opts := labelOpts()
+	opts.LabelExclude = []string{"Skip"}
+	if _, err := newRec(store, src, dst, opts).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []imap.Flag{"work"}; !slices.Equal(dst.appendedFlags[0], want) {
+		t.Fatalf("flags = %v, want %v (excluded folder must not become a keyword)", dst.appendedFlags[0], want)
+	}
+}
+
+func TestSafeFlags(t *testing.T) {
+	seen := []imap.Flag{imap.FlagSeen, imap.FlagDeleted, "$custom"}
+	cases := []struct {
+		src       []imap.Flag
+		carrySeen bool
+		want      []imap.Flag
+	}{
+		{seen, true, []imap.Flag{imap.FlagSeen}},
+		{seen, false, nil},
+		{[]imap.Flag{imap.FlagDeleted, imap.FlagFlagged}, true, nil},
+		{nil, true, nil},
+	}
+	for _, c := range cases {
+		if got := safeFlags(c.src, c.carrySeen); !slices.Equal(got, c.want) {
+			t.Errorf("safeFlags(%v, %v) = %v, want %v", c.src, c.carrySeen, got, c.want)
+		}
 	}
 }

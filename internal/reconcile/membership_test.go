@@ -27,9 +27,7 @@ func routingSetup() (*fakeStore, *fakeSource, *fakeDest) {
 	return store, src, newFakeDest()
 }
 
-func routingOpts() Options {
-	return Options{ArchiveRouting: true, SyncLabels: false}
-}
+func routingOpts() Options { return Options{ArchiveRouting: true} }
 
 func TestArchiveRoutingAtCopyTime(t *testing.T) {
 	store, src, dst := routingSetup()
@@ -183,13 +181,7 @@ func TestSynthesizedKeySkipsPropagation(t *testing.T) {
 
 func TestLabelPropagation(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: nil},
-		},
-	}
+	src := workSource("<m1@x>", "raw-1", false)
 	dst := newFakeDest()
 	rec := newRec(store, src, dst, Options{SyncLabels: true, LabelPropagate: true, SourceFolder: fakeMainFolder})
 	if _, err := rec.Run(context.Background()); err != nil {
@@ -278,17 +270,11 @@ func TestKeywordPrefixEndToEnd(t *testing.T) {
 // mail via the backfill (fingerprint change), add-only (old keyword kept).
 func TestKeywordPrefixBackfillRetagsExisting(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<m1@x>", "raw-1")}},
-		},
-	}
+	src := workSource("<m1@x>", "raw-1", true)
 	dst := newFakeDest()
 
 	// Phase 1: bare keyword.
-	rec := newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	rec := newRec(store, src, dst, labelOpts())
 	if _, err := rec.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -325,13 +311,7 @@ func TestKeywordPrefixBackfillRetagsExisting(t *testing.T) {
 
 func TestLabelPropagationDisabledMeansNoStores(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: nil},
-		},
-	}
+	src := workSource("<m1@x>", "raw-1", false)
 	dst := newFakeDest()
 	rec := newRec(store, src, dst, Options{SyncLabels: true, LabelPropagate: false, SourceFolder: fakeMainFolder})
 	if _, err := rec.Run(context.Background()); err != nil {
@@ -444,9 +424,7 @@ func sentSetup() (*fakeStore, *fakeSource, *fakeDest) {
 	return store, src, newFakeDest()
 }
 
-func sentOpts() Options {
-	return Options{ArchiveRouting: true, SentRouting: true}
-}
+func sentOpts() Options { return Options{ArchiveRouting: true, SentRouting: true} }
 
 func TestSentRoutingAtCopyTimeWithPriority(t *testing.T) {
 	store, src, dst := sentSetup()
@@ -597,13 +575,7 @@ func TestBackfillAfterEnablingRouting(t *testing.T) {
 // keywords without a matching label (user tags / stale labels) are kept.
 func TestBackfillKeywordsAddOnly(t *testing.T) {
 	store := newFakeStore()
-	src := &fakeSource{
-		uidValidity: 7,
-		msgs:        []fakeMsg{msg(1, "<m1@x>", "raw-1")},
-		labelFolders: map[string]*fakeLabelFolder{
-			"Work": {uidValidity: 71, msgs: []fakeMsg{msg(1, "<m1@x>", "raw-1")}},
-		},
-	}
+	src := workSource("<m1@x>", "raw-1", true)
 	dst := newFakeDest()
 
 	// Phase 1: mirrored without label sync.
@@ -615,7 +587,7 @@ func TestBackfillKeywordsAddOnly(t *testing.T) {
 	dst.inFolder(fakeDestFolder)[0].flags = append(dst.inFolder(fakeDestFolder)[0].flags, "mytag")
 
 	// Phase 2: label sync enabled -> backfill adds the missing keyword.
-	rec = newRec(store, src, dst, Options{SyncLabels: true, SourceFolder: fakeMainFolder})
+	rec = newRec(store, src, dst, labelOpts())
 	sum, err := rec.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -636,22 +608,23 @@ func TestBackfillKeywordsAddOnly(t *testing.T) {
 // the guard checks both folders.
 func TestGuardChecksBothFoldersUnderRouting(t *testing.T) {
 	store, src, dst := routingSetup()
-	rec := newRec(store, src, dst, routingOpts())
+	opts := routingOpts()
+	opts.DestGuard = true
+	rec := newRec(store, src, dst, opts)
 	if _, err := rec.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	// Simulate state loss (keys wiped) but keep members knowledge minimal:
-	// m1 is in the inbox, its dest copy sits in the DEST folder; m2's copy
-	// sits in ARCHIVE. Wipe the copied set — the guard must find both.
+	// Lose the dedup set and the high-water mark: every message is a
+	// candidate again, with copies in both DEST and ARCHIVE.
 	store.keys = map[string]bool{}
-	store.meta = map[string]string{} // fingerprint too: backfill idempotent anyway
+	store.lastUID = 0
 	sum, err := rec.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sum.Copied != 0 {
-		t.Fatalf("guard failed, copied %d duplicates", sum.Copied)
+	if sum.Candidates != 3 || sum.Copied != 0 || sum.SkippedDup != 3 {
+		t.Fatalf("guard failed: %+v, want 3 candidates all skipped", sum)
 	}
 	if dst.total() != 3 {
 		t.Fatalf("total = %d, want 3", dst.total())
@@ -723,5 +696,46 @@ func TestRebuildWithoutUIDNextKeepsHighWaterMark(t *testing.T) {
 	}
 	if v, last, _ := store.FolderState("INBOX"); v != 70 || last != 0 {
 		t.Fatalf("folder state = (%d, %d), want (70, 0)", v, last)
+	}
+}
+
+// Seeding covers every destination bucket under routing.
+func TestSeedFromDestScansAllBuckets(t *testing.T) {
+	store, src, dst := sentSetup()
+	dst.addExisting(fakeDestFolder, "<m1@x>", "x")
+	dst.addExisting(fakeSentFolder, "<m2@x>", "y")
+	dst.addExisting(fakeArchiveFolder, "<m3@x>", "z")
+	rec := newRec(store, src, dst, sentOpts())
+	if n, err := rec.SeedFromDest(context.Background()); err != nil || n != 3 {
+		t.Fatalf("seeded %d (err %v), want 3", n, err)
+	}
+	sum, err := rec.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Copied != 1 || sum.SkippedDup != 3 {
+		t.Fatalf("after seed: %+v, want only m4 copied", sum)
+	}
+}
+
+// Queued ops whose feature was disabled since enqueue, or of an unknown
+// kind, are dropped rather than retried forever.
+func TestStalePendingOpsDropped(t *testing.T) {
+	store, src, dst := routingSetup()
+	if _, err := newRec(store, src, dst, routingOpts()).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store.pending = []PendingOp{
+		{ID: 1, Kind: pendingMove, MessageID: "<m1@x>", Folder: "INBOX", Op: "remove"},
+		{ID: 2, Kind: "future-kind", MessageID: "<m1@x>", Folder: "INBOX", Op: "add"},
+	}
+	movesBefore := dst.moves
+	opts := labelOpts()
+	opts.LabelPropagate = true // propagation runs, routing is off
+	if _, err := newRec(store, src, dst, opts).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.pending) != 0 || dst.moves != movesBefore {
+		t.Fatalf("pending = %+v, moves %d->%d; want drained without moves", store.pending, movesBefore, dst.moves)
 	}
 }
