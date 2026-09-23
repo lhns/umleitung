@@ -201,6 +201,40 @@ mirrors:
 		{"sent folder clash archive", minimal + "    archive: { enabled: true }\n    sent: { enabled: true, folder: Archive }\n", "sent.folder must differ from archive.folder"},
 		{"unknown key (typo)", "helth_addr: ':8080'\n" + minimal, "field helth_addr not found"},
 		{"bad duration", minimal + "    poll_interval: soon\n", "invalid duration"},
+		{"negative poll_interval", minimal + "    poll_interval: -5m\n", "poll_interval must be positive"},
+		{"negative idle_reset", minimal + "    idle_reset: -1m\n", "idle_reset must be positive"},
+		{"negative uid_batch", minimal + "    uid_batch: -1\n", "uid_batch must be >= 1"},
+		{"bad log_level", "log_level: verbose\n" + minimal, "log_level must be"},
+		{"bad port", strings.Replace(minimal, "password: dp", "password: dp, port: 70000", 1), "port must be 1-65535"},
+		{"missing user", `
+mirrors:
+  - name: a
+    source: { host: h, password: p }
+    dest:   { host: h, user: u, password: p }
+`, "user is required"},
+		{"bad seed", minimal + "    seed: sometimes\n", "seed must be"},
+		{"missing name", `
+mirrors:
+  - source: { host: h, user: u, password: p }
+    dest:   { host: h, user: u, password: p }
+`, "mirror #1: name is required"},
+		{"missing password_file", `
+mirrors:
+  - name: a
+    source: { host: h, user: u, password_file: /nonexistent/secret }
+    dest:   { host: h, user: u, password: p }
+`, "source: password_file"},
+		{"dup state path (non-canonical)", `
+mirrors:
+  - name: a
+    state_path: /s/same.db
+    source: { host: h, user: u, password: p }
+    dest:   { host: h, user: u, password: p }
+  - name: b
+    state_path: /s/./same.db
+    source: { host: h, user: u, password: p }
+    dest:   { host: h, user: u, password: p }
+`, "already used"},
 		{"dup state path", `
 state_dir: /s
 mirrors:
