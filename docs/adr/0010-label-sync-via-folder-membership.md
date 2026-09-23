@@ -3,7 +3,8 @@
 Status: accepted, extended by [ADR 0011](0011-membership-propagation-archive-and-labels.md)
 (the copy-time-only limitation is lifted: `LABEL_PROPAGATE` applies post-copy
 label changes as keyword deltas, and the backfill applies missing keywords to
-already-mirrored mail)
+already-mirrored mail) and [ADR 0014](0014-configurable-keyword-prefix.md)
+(configurable keyword prefix and replacement character)
 
 ## Context
 

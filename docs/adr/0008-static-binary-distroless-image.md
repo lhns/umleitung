@@ -1,6 +1,7 @@
 # 0008 — Static binary, distroless image, all-env configuration
 
-Status: accepted
+Status: accepted, amended by [ADR 0012](0012-yaml-config-multi-mirror.md)
+(configuration is now one YAML file; env vars are gone)
 
 ## Context
 
@@ -23,9 +24,9 @@ attack surface matters.
   exception below).
 - **Health without a shell:** distroless has no curl/wget, so the container
   HEALTHCHECK re-invokes the binary itself — `umleiter -healthcheck` probes
-  the running instance's `/healthz` (which reports unhealthy if no reconcile
-  succeeded within 3× `POLL_INTERVAL`) and exits 0/1. Swarm restarts a
-  wedged container.
+  the running instance's `/healthz` (which reports unhealthy if a mirror
+  made no progress within 3× its poll interval) and exits 0/1. Swarm
+  restarts a wedged container.
 - **Structured JSON logs to stdout** (never message bodies) — Swarm/`docker
   logs` capture them; no log files in the container.
 - **CI** (GitHub Actions) runs vet+tests and publishes

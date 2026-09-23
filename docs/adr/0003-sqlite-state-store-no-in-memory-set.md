@@ -24,8 +24,10 @@ that **dedup is always an indexed per-key lookup, never an in-memory set**:
   check is `SELECT 1 WHERE message_id = ?`: O(log n), constant memory.
 - `meta(key, value)` for `uidvalidity` and `last_uid`.
 - WAL mode + busy_timeout; a single connection (one writer by construction).
-  Commits are transactional and fsync'd — no temp-file+rename dance, no
-  torn state after a crash.
+  Commits are transactional — no temp-file+rename dance, no torn state after
+  a crash. (`synchronous=NORMAL`: a power loss can drop the latest commits,
+  which state-behind-reality tolerates — the guard and seeding re-detect
+  them.)
 - Seeding (ADR 0002) streams keys into the table in batched transactions;
   no big list is ever materialized.
 

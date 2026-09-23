@@ -12,8 +12,10 @@ account's All Mail into a self-hosted mailbox.
 ## Guarantees
 
 - **Strictly one-way.** Never writes to the source, never deletes on either
-  side. Append-only: the worst any failure can cause is a *temporarily missed*
-  message, picked up on the next reconcile — never data loss, never corruption.
+  side. Append-only, apart from content-preserving MOVEs and keyword STOREs
+  when routing or label propagation is enabled: the worst any failure can
+  cause is a *temporarily missed* message, picked up on the next reconcile —
+  never data loss, never corruption.
 - **No duplicates, ever.** Idempotency is keyed on the RFC 5322 `Message-ID`
   header (not on IMAP UIDs, which reset). Three independent layers enforce it:
   1. **Destination seeding** (default on): on first start — or any start where
@@ -24,10 +26,11 @@ account's All Mail into a self-hosted mailbox.
      never loaded into RAM, so mailbox size doesn't matter). A key is recorded
      only *after* a confirmed successful APPEND — a crash in between leaves
      the message safely retryable, never duplicated.
-  3. **Destination guard** (default on): before appending a message not in
-     the set, the destination is searched for its `Message-ID` directly. This
-     closes the "appended but crashed before recording" window.
-- **No concurrent syncs.** Each mirror's sync loop is single-goroutine
+  3. **Destination guard** (default on): before appending messages not in
+     the set, the destination is searched for their `Message-ID`s directly
+     (one batched search per window). This closes the "appended but crashed
+     before recording" window.
+- **No concurrent syncs.** Each mirror runs one sequential sync loop
   (mirrors are isolated from each other), and a cross-process file lock on
   the state volume makes a second instance refuse to start. Run exactly one
   replica regardless.
@@ -83,7 +86,7 @@ on-by-default feature off, set it explicitly: `health_addr: null`.
 | `source`/`dest`.`port` | `993` | |
 | `source`/`dest`.`tls` | `true` | Implicit TLS (IMAPS); `false` only for local testing |
 | `source`/`dest`.`folder` | `INBOX` | Source accepts special-use selectors (`\All`, `\Sent`); dest folder is created if missing |
-| `source.inbox` | `INBOX` | The "in inbox" folder for archive routing |
+| `source.inbox` | `INBOX` | The "in inbox" folder for archive/sent routing |
 | `archive.enabled` | `false` | See Archive routing below |
 | `archive.folder` | `Archive` | Destination folder for archived mail; created if missing |
 | `sent.enabled` | `false` | Route sent mail to its own destination folder (see Archive routing) |
@@ -171,19 +174,22 @@ Inbox label. Umleiter derives it from folder membership: a message in the
 source folder but **not** in `source.inbox` is archived.
 
 - **Routing:** inbox members are mirrored into `dest.folder`; everything else
-  (archived and sent-only mail) goes to `archive.folder`. The initial
-  bulk run sorts years of mail correctly from the start.
+  (archived mail, and sent-only mail unless sent routing is on) goes to
+  `archive.folder`. The initial bulk run sorts years of mail correctly from
+  the start.
 - **Propagation:** archiving a message in the source later MOVEs its
   destination copy `dest.folder` → `archive.folder` on the next
-  reconcile (seconds via IDLE) — and moving it back to the source inbox moves
-  it back. Moves never delete content.
+  reconcile — and moving it back to the source inbox moves it back. Moves
+  never delete content. IDLE only wakes on *new* mail in the source folder,
+  so a pure archive action is picked up by the next reconcile that new mail
+  triggers, or at the latest after `poll_interval`.
 - **Upgrade auto-correction:** enabling the feature (or changing folders) on
   an existing mirror triggers a one-time backfill that sorts already-mirrored
   mail into the right folders (batched moves) and adds missing label
   keywords. Idempotent and crash-safe.
 - **Manual refiling respected:** if you moved a destination copy elsewhere,
   propagation skips it silently — the mirror never chases your moves.
-- Typical Gmail setup: `source.folder: 'All'`, `dest.folder: INBOX`,
+- Typical Gmail setup: `source.folder: '\All'`, `dest.folder: INBOX`,
   `archive.enabled: true` → your Stalwart INBOX mirrors your Gmail inbox, and
   your Stalwart Archive holds everything you archived.
 - Caveats: mail *deleted* in the source also leaves its inbox, so its copy
@@ -191,8 +197,8 @@ source folder but **not** in `source.inbox` is archived.
   are routed at copy time but not moved afterwards (unlocatable; rare).
 
 **Sent routing** (`sent.enabled: true`) is the same mechanism for sent mail:
-membership in the source's `\Sent` folder (resolved like any special-use
-selector; localization-proof) routes the copy to `sent.folder` so mail
+membership in `sent.source_folder` (default: the `\Sent` special-use
+selector, localization-proof) routes the copy to `sent.folder` so mail
 clients show it as sent instead of it landing in Archive. Routing priority
 when memberships overlap (e.g. mail to yourself is in inbox *and* sent):
 **inbox > sent > archive**. Propagation and the placement backfill cover
@@ -249,10 +255,10 @@ count, and progress lines are throttled to ≥30s apart):
 
 | # | Phase (log name) | Reads | Writes | Resumability |
 |---|---|---|---|---|
-| 0 | `seed` (startup only, per `SEED_DEST`) | destination folders | local state only | per window |
-| 1 | `membership` / `membership-rebuild` | source label folders + `source.inbox` | local state only | incremental scans: per window; first-time/UIDVALIDITY rebuild: per folder (an interrupted folder rescans from its start) |
-| 2 | `mirror` | source folder | **appends to the destination** (routed, with keywords) | per window (`last_uid` commits every `UID_BATCH` messages) |
-| 3 | `backfill` (only when placement config changed) | destination folders | moves + keyword additions on the destination | idempotent; reruns until completed once |
+| 0 | `seed` (startup only, per `seed`) | destination folders | local state only | per window |
+| 1 | `membership` / `membership-rebuild` | source label folders, `source.inbox`, `sent.source_folder` | local state only | incremental scans: per window; first-time/UIDVALIDITY rebuild: per folder (an interrupted folder rescans from its start) |
+| 2 | `backfill` (only when placement config changed) | destination folders | moves + keyword additions on the destination | idempotent; reruns until completed once |
+| 3 | `mirror` | source folder | **appends to the destination** (routed, with keywords) | per window (`last_uid` commits every `uid_batch` UIDs) |
 | 4 | propagation | pending-op queue | moves + keyword deltas on the destination | queued ops survive failures and retry next pass |
 
 Nothing is written to the destination before phase 2. Cancelling at any
@@ -332,20 +338,22 @@ keeps the binary static), [`gofrs/flock`](https://github.com/gofrs/flock)
 (cross-process lock).
 
 Layout: `internal/imapx` (IMAP wrapper) · `internal/state` (SQLite store) ·
-`internal/reconcile` (core algorithm) · `internal/config` · `internal/lock` ·
-`cmd/umleiter`.
+`internal/reconcile` (core algorithm) · `internal/mirror` (per-mirror
+runtime: supervision, seeding, IDLE loop) · `internal/config` ·
+`internal/lock` · `internal/integration` (end-to-end tests) · `cmd/umleiter`.
 
 ```sh
 go test ./...
 docker build -t umleitung .
 ```
 
-Tests include a self-contained end-to-end suite (`internal/integration`) that
-spins up two in-memory IMAP servers (go-imap's `imapmemserver`) and runs the
-full mirror over real IMAP connections: first sync, duplicate Message-ID,
-missing Message-ID, state wipe + re-seed, incremental sync, the
-append-but-not-recorded crash window, UIDVALIDITY reset, and flag policy.
-No Docker or network required.
+The end-to-end suite (`internal/integration`) runs the full stack against
+in-memory IMAP servers (go-imap's `imapmemserver`) over real loopback
+connections: dedup (duplicate/missing Message-ID, state wipe + re-seed, the
+append-but-not-recorded crash window, UIDVALIDITY reset), flag policy, label
+sync and propagation, archive and sent routing, the upgrade backfill, and
+concurrent mirrors via the runtime (startup seeding, IDLE-pushed sync). No
+Docker or network required.
 
 Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/).
 

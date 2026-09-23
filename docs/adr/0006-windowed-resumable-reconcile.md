@@ -24,7 +24,11 @@ Scan `[last_uid+1 .. UIDNEXT-1]` in ascending UID windows of `UID_BATCH`
   single round trip. (This also made a separate `UID SEARCH` step
   unnecessary — a UID-range FETCH returns only existing UIDs.)
 - Messages are fetched-full and appended **one at a time** — at most one
-  message body in memory.
+  message body in memory. (Since relaxed for throughput: bodies stream
+  through a bounded fetch→append pipeline of a few messages, appends are
+  pipelined, and dedup keys are flushed in small batches; the destination
+  guard covers the wider appended-but-unrecorded window. With the guard off
+  it degrades to the strict one-at-a-time mode.)
 - The dedup key is inserted per successful append; **`last_uid` commits once
   per window**, making the scan resumable at window granularity.
 - Gmail throttle/quota errors and disconnects are treated as *expected*: the
@@ -34,7 +38,7 @@ Scan `[last_uid+1 .. UIDNEXT-1]` in ascending UID windows of `UID_BATCH`
 
 ## Consequences
 
-- Memory is bounded by one window of header metadata + one message body,
+- Memory is bounded by one window of header metadata + a few message bodies,
   independent of mailbox size.
 - A multi-day, quota-throttled first run is safe to interrupt at any point;
   re-scanning is bounded to at most one window (whose appends are dedup-

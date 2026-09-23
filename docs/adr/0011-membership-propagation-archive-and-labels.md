@@ -81,9 +81,11 @@ refreshes real UIDs. Downgrade protection: refuse dbs with a newer version.
 
 ## Consequences
 
-- Gmail-archiving behavior now mirrors naturally: seconds-latency moves via
-  the IDLE-driven reconcile; the initial bulk run routes years of archived
-  mail directly to Archive; sent-only mail lands in Archive, not the inbox.
+- Gmail-archiving behavior now mirrors naturally: moves happen on the next
+  reconcile (IDLE wakes only on new mail, so a pure archive action waits for
+  the next new message or `poll_interval`); the initial bulk run routes years
+  of archived mail directly to Archive; sent-only mail lands in Archive, not
+  the inbox.
 - Fully automatic upgrade from the previously deployed version: open db →
   migrate → first reconcile rebuilds membership → fingerprint mismatch →
   backfill sorts existing mail. No manual steps.

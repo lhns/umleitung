@@ -34,8 +34,9 @@ checked before any append:
    "appended but not yet recorded".
 3. **Destination guard (default on, `DEST_GUARD`)** — for any candidate not
    in the set, `UID SEARCH HEADER Message-ID <id>` against the destination
-   before appending. This closes the layer-2 crash window. One extra round
-   trip per *new* message; negligible in steady state.
+   before appending. This closes the layer-2 crash window. (Since batched:
+   one OR-combined `UID SEARCH` per UID window and destination folder, not
+   one round trip per new message.)
 
 Either layer 1 or layer 3 alone already guarantees no duplicates; both is
 belt-and-suspenders. On UIDVALIDITY change, only the UID high-water mark is

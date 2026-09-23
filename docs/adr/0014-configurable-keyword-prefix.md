@@ -25,9 +25,14 @@ Bulwark users set `"$label:"`. Applied uniformly at the three keyword sites:
 copy-time append, post-copy STORE propagation, and the placement/keyword
 backfill.
 
-The prefix is part of the backfill fingerprint, so changing it on an existing
-mirror re-runs the backfill and add-only-STOREs the new-form keyword onto all
-already-mirrored labeled mail (the old bare keyword remains, inert). The
+The companion `labels.keyword_replacement` (default `_`) sets the character
+sanitization substitutes for disallowed runes, because Bulwark slugifies with
+`-` (`Wichtige Mails` → `wichtige-mails`); a single `[A-Za-z0-9_-]` char,
+threaded through the same three sites.
+
+Both settings are part of the backfill fingerprint, so changing either on an
+existing mirror re-runs the backfill and add-only-STOREs the new-form keyword
+onto all already-mirrored labeled mail (the old keyword remains, inert). The
 backfill was additionally moved to run BEFORE the mirror loop so this
 correction happens promptly on the next start rather than only after a
 days-long first run completes.
