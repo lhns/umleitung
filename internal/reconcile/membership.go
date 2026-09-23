@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -34,7 +35,7 @@ func (r *Reconciler) syncMembership(ctx context.Context) error {
 			kind = pendingKeyword
 		}
 		for _, f := range folders {
-			if f.Name == r.opts.SourceInbox || !isLabelFolder(f, r.opts.SourceFolder, exclude) {
+			if r.isRoutingFolder(f.Name) || !isLabelFolder(f, r.opts.SourceFolder, exclude) {
 				continue
 			}
 			list = append(list, watched{f.Name, kind})
@@ -194,7 +195,7 @@ func (r *Reconciler) rebuildWatchedFolder(ctx context.Context, folder, pendingKi
 	if err := r.store.MemberChangeBatch(folder, removals); err != nil {
 		return err
 	}
-	return r.store.SetFolderState(folder, uidValidity, uidNext-1)
+	return r.store.SetFolderState(folder, uidValidity, max(uidNext, 1)-1)
 }
 
 // gatePending returns the pending-op kind for a membership change, or "" when
@@ -221,14 +222,13 @@ func (r *Reconciler) labelsFor(key string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := folders[:0]
-	for _, f := range folders {
-		if f == r.opts.SourceInbox || (r.opts.SentRouting && f == r.opts.SentSrcFolder) {
-			continue
-		}
-		out = append(out, f)
-	}
-	return out, nil
+	return slices.DeleteFunc(folders, r.isRoutingFolder), nil
+}
+
+// isRoutingFolder reports whether a watched source folder drives placement
+// (inbox/sent) rather than labels.
+func (r *Reconciler) isRoutingFolder(folder string) bool {
+	return folder == r.opts.SourceInbox || (r.opts.SentRouting && folder == r.opts.SentSrcFolder)
 }
 
 // destFolderFor routes a message by source-folder membership, priority:
@@ -446,7 +446,6 @@ func (r *Reconciler) backfillDestFolder(ctx context.Context, folder string, sum 
 				}
 				if want != folder {
 					wrongByDest[want] = append(wrongByDest[want], metas[i].UID)
-					continue // keywords follow the message; fixed after the move next backfill-free run
 				}
 			}
 

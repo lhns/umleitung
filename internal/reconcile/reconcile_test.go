@@ -23,6 +23,8 @@ type fakeStore struct {
 	keys        map[string]bool
 	failRecord  bool
 
+	failSetUIDValidity, failSetLastUID bool // simulate a crash at that write
+
 	members      map[string]map[string]uint32 // folder -> key -> uid
 	folderStates map[string][2]uint32         // folder -> {uidvalidity, last_uid}
 	pending      []PendingOp
@@ -40,9 +42,21 @@ func newFakeStore() *fakeStore {
 }
 
 func (s *fakeStore) UIDValidity() (uint32, error)  { return s.uidValidity, nil }
-func (s *fakeStore) SetUIDValidity(v uint32) error { s.uidValidity = v; return nil }
-func (s *fakeStore) LastUID() (uint32, error)      { return s.lastUID, nil }
-func (s *fakeStore) SetLastUID(u uint32) error     { s.lastUID = u; return nil }
+func (s *fakeStore) SetUIDValidity(v uint32) error {
+	if s.failSetUIDValidity {
+		return fmt.Errorf("set uidvalidity failed (injected)")
+	}
+	s.uidValidity = v
+	return nil
+}
+func (s *fakeStore) LastUID() (uint32, error) { return s.lastUID, nil }
+func (s *fakeStore) SetLastUID(u uint32) error {
+	if s.failSetLastUID {
+		return fmt.Errorf("set last_uid failed (injected)")
+	}
+	s.lastUID = u
+	return nil
+}
 func (s *fakeStore) HasKey(k string) (bool, error) { return s.keys[k], nil }
 func (s *fakeStore) RecordKey(k string, _ uint32, _ int64) error {
 	if s.failRecord {
@@ -170,6 +184,7 @@ type fakeLabelFolder struct {
 	uidValidity uint32
 	msgs        []fakeMsg
 	attrs       []imap.MailboxAttr
+	noUIDNext   bool // SELECT reports UIDNEXT 0 (omitted by the server)
 }
 
 type fakeSource struct {
@@ -205,6 +220,9 @@ func (f *fakeSource) SelectNamedFolder(name string) (uint32, uint32, uint32, err
 		return 0, 0, 0, fmt.Errorf("no such folder %q", name)
 	}
 	f.selected = name
+	if lf.noUIDNext {
+		return lf.uidValidity, 0, uint32(len(lf.msgs)), nil
+	}
 	return lf.uidValidity, uidNextOf(lf.msgs), uint32(len(lf.msgs)), nil
 }
 
@@ -870,5 +888,64 @@ func TestContextCancelStopsBetweenMessages(t *testing.T) {
 	}
 	if len(dst.appended) != 0 {
 		t.Fatal("appended despite cancelled context")
+	}
+}
+
+// A crash between the two writes of a UIDVALIDITY reset must not leave the
+// old high-water mark paired with the new UIDVALIDITY (which would silently
+// skip every new-space UID below it).
+func TestUIDValidityResetCrashSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		inject func(*fakeStore)
+	}{
+		{"first write fails", func(s *fakeStore) { s.failSetLastUID = true }},
+		{"second write fails", func(s *fakeStore) { s.failSetUIDValidity = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			src := &fakeSource{uidValidity: 7, msgs: []fakeMsg{msg(10, "<a@x>", "raw-a")}}
+			dst := newFakeDest()
+			rec := newRec(store, src, dst, Options{})
+			if _, err := rec.Run(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			src.uidValidity = 8
+			src.msgs = []fakeMsg{msg(1, "<a@x>", "raw-a"), msg(2, "<b@x>", "raw-b")}
+			tc.inject(store)
+			if _, err := rec.Run(context.Background()); err == nil {
+				t.Fatal("want injected error")
+			}
+
+			store.failSetLastUID, store.failSetUIDValidity = false, false
+			if _, err := rec.Run(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if findDstMsg(dst, "<b@x>") == nil {
+				t.Fatal("<b@x> (new UID below the old high-water mark) never mirrored")
+			}
+			if dst.total() != 2 {
+				t.Fatalf("total = %d, want 2", dst.total())
+			}
+		})
+	}
+}
+
+// Two source messages sharing a Message-ID in one window are copied once.
+func TestDuplicateKeyWithinWindowCopiedOnce(t *testing.T) {
+	for _, guard := range []bool{false, true} {
+		store := newFakeStore()
+		src := &fakeSource{uidValidity: 7, msgs: []fakeMsg{
+			msg(1, "<a@x>", "raw-a"), msg(2, "<a@x>", "raw-a2"),
+		}}
+		dst := newFakeDest()
+		sum, err := newRec(store, src, dst, Options{DestGuard: guard}).Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sum.Copied != 1 || sum.SkippedDup != 1 || dst.total() != 1 {
+			t.Fatalf("guard=%v: %+v total=%d, want 1 copied / 1 skipped", guard, sum, dst.total())
+		}
 	}
 }
