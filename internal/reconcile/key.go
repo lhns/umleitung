@@ -12,12 +12,10 @@ import (
 // synthPrefix marks dedup keys synthesized for messages without a Message-ID.
 const synthPrefix = "synth-sha256:"
 
-// DedupKey returns the stable deduplication key for a message.
-//
-// Normally this is the trimmed raw Message-ID header value. For the rare (but
-// legal) messages without one, a stable key is synthesized from a SHA-256 hash
-// of (INTERNALDATE, From, Subject, size) — the same inputs are available when
-// seeding from the destination, so both sides compute identical keys.
+// DedupKey returns the stable deduplication key for a message: the trimmed
+// Message-ID, or for messages without one a SHA-256 over (INTERNALDATE, From,
+// Subject, size) — inputs that survive the copy, so seeding from the
+// destination computes identical keys (ADR 0007).
 func DedupKey(m *imapx.MsgMeta) string {
 	if id := strings.TrimSpace(m.MessageID); id != "" {
 		return id

@@ -65,7 +65,6 @@ func (s *fakeStore) RecordKey(k string, _ uint32, _ int64) error {
 	s.keys[k] = true
 	return nil
 }
-func (s *fakeStore) CopiedCount() (int64, error) { return int64(len(s.keys)), nil }
 func (s *fakeStore) SeedBatch(keys []string) error {
 	for _, k := range keys {
 		s.keys[k] = true

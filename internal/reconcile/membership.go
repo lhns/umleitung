@@ -4,23 +4,22 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
 
+	"github.com/lhns/umleitung/internal/imapx"
 	"github.com/lhns/umleitung/internal/state"
 )
 
-// pendingMove/pendingKeyword are the pending-op kinds (state.pending.kind).
+// Pending-op kinds (state.pending.kind).
 const (
 	pendingMove    = "move"
 	pendingKeyword = "keyword"
 )
 
 // syncMembership scans every watched source folder (label folders and/or the
-// source INBOX) and records membership changes. Runs before the mirror phase
-// so routing and copy-time keywords see current state.
+// routing folders) and records membership changes.
 func (r *Reconciler) syncMembership(ctx context.Context) error {
 	type watched struct{ name, kind string }
 	var list []watched
@@ -68,13 +67,11 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind,
 	if err != nil {
 		return err
 	}
-
 	if storedValidity != uidValidity {
 		return r.rebuildWatchedFolder(ctx, folder, pendingKind, item, uidValidity, uidNext)
 	}
 
-	// Removal detection: uid-set diff against the full current snapshot,
-	// applied as one batched transaction.
+	// Removals: stored uids missing from the current snapshot.
 	currentUIDs, err := r.src.SearchAllUIDs()
 	if err != nil {
 		return err
@@ -87,62 +84,34 @@ func (r *Reconciler) syncWatchedFolder(ctx context.Context, folder, pendingKind,
 	if err != nil {
 		return err
 	}
-	var removals []state.MemberChangeItem
+	var gone []string
 	for uid, key := range stored {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		if !current[uid] {
-			kind, err := r.gatePending(key, pendingKind)
-			if err != nil {
-				return err
-			}
-			removals = append(removals, state.MemberChangeItem{Key: key, PendingKind: kind})
+			gone = append(gone, key)
 		}
 	}
-	if err := r.store.MemberChangeBatch(folder, removals); err != nil {
+	if err := r.recordRemovals(ctx, folder, pendingKind, gone); err != nil {
 		return err
 	}
 
-	// Addition detection: windowed scan above the high-water mark; one
-	// transaction per window.
-	for start := lastUID + 1; start < uidNext; start += uint32(r.opts.UIDBatch) {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		stop := min(start+uint32(r.opts.UIDBatch)-1, uidNext-1)
-		metas, err := r.src.FetchMetaRange(imap.UID(start), imap.UID(stop))
+	// Additions: windowed scan above the high-water mark.
+	return r.scanWindows(ctx, lastUID+1, uidNext, r.src.FetchMetaRange, func(stop uint32, metas []imapx.MsgMeta) error {
+		err := r.recordAdditions(folder, metas, func(string) string { return pendingKind })
 		if err != nil {
-			return fmt.Errorf("window %d:%d: %w", start, stop, err)
-		}
-		items := make([]state.MemberChangeItem, 0, len(metas))
-		for i := range metas {
-			key := DedupKey(&metas[i])
-			kind, err := r.gatePending(key, pendingKind)
-			if err != nil {
-				return err
-			}
-			items = append(items, state.MemberChangeItem{Key: key, UID: uint32(metas[i].UID), Add: true, PendingKind: kind})
-		}
-		if err := r.store.MemberChangeBatch(folder, items); err != nil {
 			return err
 		}
 		if err := r.store.SetFolderState(folder, uidValidity, stop); err != nil {
 			return err
 		}
 		r.opts.progress("membership", item, int(stop))
-	}
-	if uidNext <= 1 || lastUID >= uidNext-1 {
-		// Nothing scanned; still keep state current.
-		return r.store.SetFolderState(folder, uidValidity, lastUID)
-	}
-	return nil
+		return nil
+	})
 }
 
 // rebuildWatchedFolder handles first-time scans and UIDVALIDITY resets: a
-// full windowed scan, diffed against stored membership BY KEY (stored uids
-// are meaningless). Pending ops are suppressed when the stored set was empty
-// (feature activation — the placement backfill covers existing mail).
+// full scan diffed against stored membership BY KEY (stored uids are
+// meaningless). Pending ops are suppressed when nothing was stored (feature
+// activation — the placement backfill covers existing mail).
 func (r *Reconciler) rebuildWatchedFolder(ctx context.Context, folder, pendingKind, item string, uidValidity, uidNext uint32) error {
 	storedKeys, err := r.store.MemberKeys(folder)
 	if err != nil {
@@ -150,73 +119,81 @@ func (r *Reconciler) rebuildWatchedFolder(ctx context.Context, folder, pendingKi
 	}
 	firstScan := len(storedKeys) == 0
 	seen := map[string]bool{}
-	for start := uint32(1); start < uidNext; start += uint32(r.opts.UIDBatch) {
-		if err := ctx.Err(); err != nil {
-			return err
+	kindFor := func(key string) string {
+		seen[key] = true
+		if firstScan || storedKeys[key] {
+			return "" // activation or uid refresh, not a membership change
 		}
-		stop := min(start+uint32(r.opts.UIDBatch)-1, uidNext-1)
-		metas, err := r.src.FetchMetaRange(imap.UID(start), imap.UID(stop))
-		if err != nil {
-			return fmt.Errorf("rebuild window %d:%d: %w", start, stop, err)
-		}
-		items := make([]state.MemberChangeItem, 0, len(metas))
-		for i := range metas {
-			key := DedupKey(&metas[i])
-			seen[key] = true
-			kind := ""
-			if !firstScan && !storedKeys[key] {
-				// New member; first activation and uid refreshes need no
-				// pending op (backfill handles existing mail's placement).
-				if kind, err = r.gatePending(key, pendingKind); err != nil {
-					return err
-				}
-			}
-			items = append(items, state.MemberChangeItem{Key: key, UID: uint32(metas[i].UID), Add: true, PendingKind: kind})
-		}
-		if err := r.store.MemberChangeBatch(folder, items); err != nil {
+		return pendingKind
+	}
+	err = r.scanWindows(ctx, 1, uidNext, r.src.FetchMetaRange, func(stop uint32, metas []imapx.MsgMeta) error {
+		if err := r.recordAdditions(folder, metas, kindFor); err != nil {
 			return err
 		}
 		r.opts.progress("membership-rebuild", item, int(stop))
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	// Stored members no longer present anywhere in the folder -> removals.
-	var removals []state.MemberChangeItem
+	var gone []string
 	for key := range storedKeys {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		if !seen[key] {
-			kind, err := r.gatePending(key, pendingKind)
-			if err != nil {
-				return err
-			}
-			removals = append(removals, state.MemberChangeItem{Key: key, PendingKind: kind})
+			gone = append(gone, key)
 		}
 	}
-	if err := r.store.MemberChangeBatch(folder, removals); err != nil {
+	if err := r.recordRemovals(ctx, folder, pendingKind, gone); err != nil {
 		return err
 	}
 	return r.store.SetFolderState(folder, uidValidity, max(uidNext, 1)-1)
 }
 
-// gatePending returns the pending-op kind for a membership change, or "" when
-// no destination op is applicable: the message must already be mirrored and
-// locatable by a real Message-ID.
+// recordAdditions records metas as members of folder in one batch; kindFor
+// returns each message's ungated pending-op kind.
+func (r *Reconciler) recordAdditions(folder string, metas []imapx.MsgMeta, kindFor func(key string) string) error {
+	items := make([]state.MemberChangeItem, 0, len(metas))
+	for i := range metas {
+		key := DedupKey(&metas[i])
+		kind, err := r.gatePending(key, kindFor(key))
+		if err != nil {
+			return err
+		}
+		items = append(items, state.MemberChangeItem{Key: key, UID: uint32(metas[i].UID), Add: true, PendingKind: kind})
+	}
+	return r.store.MemberChangeBatch(folder, items)
+}
+
+// recordRemovals records keys as no longer members of folder in one batch.
+func (r *Reconciler) recordRemovals(ctx context.Context, folder, pendingKind string, keys []string) error {
+	items := make([]state.MemberChangeItem, 0, len(keys))
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		kind, err := r.gatePending(key, pendingKind)
+		if err != nil {
+			return err
+		}
+		items = append(items, state.MemberChangeItem{Key: key, PendingKind: kind})
+	}
+	return r.store.MemberChangeBatch(folder, items)
+}
+
+// gatePending returns pendingKind, or "" when no destination op applies: the
+// message must already be mirrored and locatable by a real Message-ID.
 func (r *Reconciler) gatePending(key, pendingKind string) (string, error) {
 	if pendingKind == "" || !IsRealMessageID(key) {
 		return "", nil
 	}
 	copied, err := r.store.HasKey(key)
-	if err != nil {
+	if err != nil || !copied {
 		return "", err
-	}
-	if !copied {
-		return "", nil
 	}
 	return pendingKind, nil
 }
 
-// labelsFor returns the labels of a message: its watched-folder memberships
-// minus the routing folders (inbox/sent membership is placement, not a label).
+// labelsFor returns a message's watched-folder memberships minus the routing
+// folders.
 func (r *Reconciler) labelsFor(key string) ([]string, error) {
 	folders, err := r.store.MemberFolders(key)
 	if err != nil {
@@ -232,8 +209,7 @@ func (r *Reconciler) isRoutingFolder(folder string) bool {
 }
 
 // destFolderFor routes a message by source-folder membership, priority:
-// inbox > sent > archive > primary. (A mail-to-self is in inbox AND sent —
-// the inbox wins.)
+// inbox > sent > archive > primary (mail-to-self is in inbox AND sent).
 func (r *Reconciler) destFolderFor(key string) (string, error) {
 	if r.opts.ArchiveRouting || r.opts.SentRouting {
 		inInbox, err := r.store.MemberHas(r.opts.SourceInbox, key)
@@ -272,22 +248,21 @@ func (r *Reconciler) destBucketFolders() []string {
 	return folders
 }
 
-// countMove attributes a completed move to the summary by target folder.
-func (r *Reconciler) countMove(sum *Summary, desired string) {
+// countMove attributes n completed moves to the summary by target folder.
+func (r *Reconciler) countMove(sum *Summary, desired string, n int) {
 	switch desired {
 	case r.opts.ArchiveFolder:
-		sum.MovedToArchive++
+		sum.MovedToArchive += n
 	case r.opts.SentFolder:
-		sum.MovedToSent++
+		sum.MovedToSent += n
 	default:
-		sum.MovedToInbox++
+		sum.MovedToInbox += n
 	}
 }
 
-// propagate drains the pending-operation queue: moves for inbox-membership
-// changes, keyword STOREs for label changes. A pending row is deleted only
-// after the operation is confirmed (or definitively unnecessary); on error
-// it survives and is retried next reconcile.
+// propagate drains the pending-operation queue. A row is deleted only after
+// its operation is confirmed (or definitively unnecessary); on error it
+// survives and is retried next reconcile.
 func (r *Reconciler) propagate(ctx context.Context, sum *Summary) error {
 	for {
 		ops, err := r.store.PendingOps(200)
@@ -297,9 +272,8 @@ func (r *Reconciler) propagate(ctx context.Context, sum *Summary) error {
 		if len(ops) == 0 {
 			return nil
 		}
-		// Delete applied ops in one transaction per drained page; on a
-		// mid-page failure only the completed prefix is deleted (the failed
-		// op survives and retries next pass).
+		// One delete transaction per page; on failure only the completed
+		// prefix is deleted.
 		var done []int64
 		for _, op := range ops {
 			if err := ctx.Err(); err != nil {
@@ -326,7 +300,7 @@ func (r *Reconciler) applyPending(op PendingOp, sum *Summary) error {
 		}
 		// Recompute the desired bucket from current membership (robust
 		// against stacked/stale ops) and move the copy there from whichever
-		// bucket it currently sits in.
+		// bucket holds it.
 		desired, err := r.destFolderFor(op.MessageID)
 		if err != nil {
 			return err
@@ -340,7 +314,7 @@ func (r *Reconciler) applyPending(op PendingOp, sum *Summary) error {
 				return err
 			}
 			if moved {
-				r.countMove(sum, desired)
+				r.countMove(sum, desired, 1)
 				break
 			}
 		}
@@ -365,7 +339,7 @@ func (r *Reconciler) applyPending(op PendingOp, sum *Summary) error {
 		}
 		return nil
 	default:
-		return nil // unknown kind from a future version: drop (downgrade protection exists anyway)
+		return nil // unknown kind from a future version: drop
 	}
 }
 
@@ -386,10 +360,9 @@ func (r *Reconciler) backfillFingerprint() string {
 }
 
 // maybeBackfill auto-corrects mail mirrored before the current routing/label
-// configuration was active: moves messages to the correct dest folder and
-// adds missing label keywords (add-only — a stale keyword is
-// indistinguishable from a user-set tag, so backfill never removes).
-// Idempotent; the fingerprint is stored only after full completion.
+// configuration was active: moves messages to the right bucket and adds
+// missing label keywords (add-only — a stale keyword is indistinguishable
+// from a user tag). The fingerprint is stored only after full completion.
 func (r *Reconciler) maybeBackfill(ctx context.Context, sum *Summary) error {
 	fp := r.backfillFingerprint()
 	stored, err := r.store.MetaGet("backfill_fingerprint")
@@ -426,19 +399,10 @@ func (r *Reconciler) backfillDestFolder(ctx context.Context, folder string, sum 
 	kwGroups := map[string][]imap.UID{}    // sorted missing-keyword signature -> uids
 	kwFlags := map[string][]imap.Flag{}
 
-	for start := uint32(1); start < uidNext; start += uint32(r.opts.UIDBatch) {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		stop := min(start+uint32(r.opts.UIDBatch)-1, uidNext-1)
-		metas, err := r.dst.FetchMetaRange(imap.UID(start), imap.UID(stop))
-		if err != nil {
-			return fmt.Errorf("window %d:%d: %w", start, stop, err)
-		}
+	err = r.scanWindows(ctx, 1, uidNext, r.dst.FetchMetaRange, func(stop uint32, metas []imapx.MsgMeta) error {
 		r.opts.progress("backfill", folder, int(stop))
 		for i := range metas {
 			key := DedupKey(&metas[i])
-
 			if routing {
 				want, err := r.destFolderFor(key)
 				if err != nil {
@@ -448,53 +412,50 @@ func (r *Reconciler) backfillDestFolder(ctx context.Context, folder string, sum 
 					wrongByDest[want] = append(wrongByDest[want], metas[i].UID)
 				}
 			}
-
 			if r.opts.SyncLabels {
 				labels, err := r.labelsFor(key)
 				if err != nil {
 					return err
 				}
-				missing := r.missingKeywords(labels, metas[i].Flags)
-				if len(missing) > 0 {
+				if missing := r.missingKeywords(labels, metas[i].Flags); len(missing) > 0 {
 					sig := flagSig(missing)
 					kwGroups[sig] = append(kwGroups[sig], metas[i].UID)
 					kwFlags[sig] = missing
 				}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
-	// Apply keyword additions first (STOREs reference UIDs in this folder,
-	// which must happen before those messages potentially move away).
+	// Keywords first: STOREs address UIDs in this folder, so they must land
+	// before those messages move away (keywords travel with the move).
 	for sig, uids := range kwGroups {
-		for c := range slicesChunk(len(uids), moveChunk) {
-			if err := r.dst.StoreKeywordsUIDs(uids[c[0]:c[1]], kwFlags[sig]); err != nil {
+		for chunk := range slices.Chunk(uids, moveChunk) {
+			if err := r.dst.StoreKeywordsUIDs(chunk, kwFlags[sig]); err != nil {
 				return err
 			}
 		}
 		sum.KeywordsUpdated += len(uids)
 	}
-
-	// Then move wrong-side messages to their desired buckets, in chunks.
 	for want, uids := range wrongByDest {
-		for c := range slicesChunk(len(uids), moveChunk) {
+		for chunk := range slices.Chunk(uids, moveChunk) {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if err := r.dst.MoveUIDs(folder, uids[c[0]:c[1]], want); err != nil {
+			if err := r.dst.MoveUIDs(folder, chunk, want); err != nil {
 				return err
 			}
 		}
-		for range uids {
-			r.countMove(sum, want)
-		}
+		r.countMove(sum, want, len(uids))
 	}
 	return nil
 }
 
 // missingKeywords returns keyword flags for labels not yet present in flags
-// (add-only: never removes existing keywords, e.g. an old bare keyword left
-// over after switching the keyword prefix).
+// (case-insensitive; never removes existing keywords).
 func (r *Reconciler) missingKeywords(labels []string, flags []imap.Flag) []imap.Flag {
 	present := map[string]bool{}
 	for _, f := range flags {
@@ -514,18 +475,6 @@ func flagSig(flags []imap.Flag) string {
 	for i, f := range flags {
 		ss[i] = string(f)
 	}
-	sort.Strings(ss)
+	slices.Sort(ss)
 	return strings.Join(ss, "\x00")
-}
-
-// slicesChunk yields [start, end) index pairs over n items in chunks.
-func slicesChunk(n, chunk int) func(func([2]int) bool) {
-	return func(yield func([2]int) bool) {
-		for start := 0; start < n; start += chunk {
-			end := min(start+chunk, n)
-			if !yield([2]int{start, end}) {
-				return
-			}
-		}
-	}
 }

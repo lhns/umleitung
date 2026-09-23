@@ -8,10 +8,8 @@ import (
 	"github.com/lhns/umleitung/internal/imapx"
 )
 
-// excludedAttrs are folder attributes that disqualify a folder from being
-// treated as a label: unselectable folders and special-use folders (Sent,
-// Trash, Junk, All Mail, Starred, Important, ...). These represent mailbox
-// roles, not user labels.
+// excludedAttrs disqualify a folder from being a label: unselectable and
+// special-use folders represent mailbox roles, not user labels.
 var excludedAttrs = map[imap.MailboxAttr]bool{
 	imap.MailboxAttrNoSelect:    true,
 	imap.MailboxAttrNonExistent: true,
@@ -25,9 +23,8 @@ var excludedAttrs = map[imap.MailboxAttr]bool{
 	imap.MailboxAttrImportant:   true,
 }
 
-// isLabelFolder decides whether a listed folder counts as a label folder.
-// Excluded: the mirror source folder itself, INBOX (inbox membership is not
-// a label), special-use/unselectable folders, and user-configured exclusions.
+// isLabelFolder reports whether a listed folder counts as a label: not the
+// mirror source folder, INBOX, a special-use/unselectable folder or excluded.
 func isLabelFolder(f imapx.FolderInfo, sourceFolder string, exclude map[string]bool) bool {
 	if f.Name == sourceFolder || strings.EqualFold(f.Name, "INBOX") {
 		return false
@@ -43,15 +40,13 @@ func isLabelFolder(f imapx.FolderInfo, sourceFolder string, exclude map[string]b
 	return true
 }
 
-// keywordFor maps a label (folder name) to an IMAP keyword. IMAP flag
-// keywords must be RFC 3501 atoms — printable ASCII without ( ) { % * " \ ]
-// or spaces — so labels are sanitized: every disallowed rune becomes the
-// replacement character (repl), runs are collapsed and trimmed. The result
-// is lowercased because IMAP flags are case-insensitive and servers
-// canonicalize them anyway.
-// With repl='-': "[Werbung]" -> "werbung", "Work/Projects" -> "work-projects",
-// "Bücher" -> "b-cher". Returns "" (skip) if nothing survives. Distinct
-// labels may collide after sanitization; documented and harmless.
+// keywordFor maps a label (folder name) to an IMAP keyword slug. Keywords
+// must be RFC 3501 atoms, so every rune other than ASCII alphanumerics, '-'
+// and '_' becomes repl's first byte (default '_'); runs are collapsed and
+// trimmed, and the result is lowercased (IMAP flags are case-insensitive).
+// With repl "-": "[Werbung]" -> "werbung", "Work/Projects" -> "work-projects",
+// "Bücher" -> "b-cher". Returns "" if nothing survives. Distinct labels may
+// collide; documented and harmless.
 func keywordFor(label, repl string) string {
 	rc := byte('_')
 	if len(repl) > 0 {
@@ -60,8 +55,6 @@ func keywordFor(label, repl string) string {
 	var b strings.Builder
 	lastRepl := false
 	for _, r := range label {
-		// Keep ASCII alphanumerics and both separators (- and _ are valid
-		// keyword atom chars); everything else becomes the replacement.
 		keep := r < 128 && (r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
 			r >= '0' && r <= '9' || r == '-' || r == '_')
 		if keep {
@@ -75,9 +68,8 @@ func keywordFor(label, repl string) string {
 	return strings.ToLower(strings.Trim(b.String(), string(rc)))
 }
 
-// labelKeyword maps one label to its destination keyword flag, applying the
-// configured prefix (e.g. "$label:" for Bulwark) outside sanitization. Returns
-// "" when the sanitized slug is empty.
+// labelKeyword maps one label to its keyword flag; the configured prefix is
+// applied outside sanitization. Returns "" when the slug is empty.
 func (r *Reconciler) labelKeyword(label string) imap.Flag {
 	slug := keywordFor(label, r.opts.KeywordReplacement)
 	if slug == "" {
@@ -86,8 +78,7 @@ func (r *Reconciler) labelKeyword(label string) imap.Flag {
 	return imap.Flag(r.opts.KeywordPrefix + slug)
 }
 
-// labelKeywords converts recorded labels to keyword flags (deduplicated,
-// empty results skipped).
+// labelKeywords converts labels to deduplicated, non-empty keyword flags.
 func (r *Reconciler) labelKeywords(labels []string) []imap.Flag {
 	var flags []imap.Flag
 	seen := map[imap.Flag]bool{}
@@ -101,6 +92,3 @@ func (r *Reconciler) labelKeywords(labels []string) []imap.Flag {
 	}
 	return flags
 }
-
-// The membership scan itself lives in membership.go — label folders and the
-// source INBOX share one generalized, diff-based engine.
