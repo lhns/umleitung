@@ -586,8 +586,6 @@ func TestSentRoutingEndToEnd(t *testing.T) {
 // when label sync is on, not double as a label.
 func TestSentFolderWithLabels(t *testing.T) {
 	t.Parallel()
-	t.Skip("known bug: syncMembership scans the sent source folder as a label folder unless it carries \\Sent; " +
-		"its changes then enqueue keyword ops instead of moves (internal/reconcile/membership.go)")
 	srcEP, dstEP, _ := setup(t, srcInbox, srcSent)
 	m1 := rawMessage("<m1@test>", "sent")
 	appendMsg(t, srcEP, srcFolder, m1, at(0))
