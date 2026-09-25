@@ -1,4 +1,4 @@
-module github.com/lhns/umleitung
+module github.com/lhns/umleiter
 
 go 1.26.2
 

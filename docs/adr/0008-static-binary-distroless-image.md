@@ -30,7 +30,7 @@ attack surface matters.
 - **Structured JSON logs to stdout** (never message bodies) — Swarm/`docker
   logs` capture them; no log files in the container.
 - **CI** (GitHub Actions) runs vet+tests and publishes
-  `ghcr.io/lhns/umleitung:latest`, which `docker-compose.yml` and `stack.yml`
+  `ghcr.io/lhns/umleiter:latest`, which `docker-compose.yml` and `stack.yml`
   reference — deployment is `docker stack deploy -c stack.yml umleiter` plus
   two secrets and one directory.
 

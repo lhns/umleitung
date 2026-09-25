@@ -16,7 +16,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-message"
 
-	"github.com/lhns/umleitung/internal/config"
+	"github.com/lhns/umleiter/internal/config"
 )
 
 // MsgMeta is the cheap per-message metadata used for dedup-key computation

@@ -17,9 +17,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lhns/umleitung/internal/config"
-	"github.com/lhns/umleitung/internal/lock"
-	"github.com/lhns/umleitung/internal/mirror"
+	"github.com/lhns/umleiter/internal/config"
+	"github.com/lhns/umleiter/internal/lock"
+	"github.com/lhns/umleiter/internal/mirror"
 )
 
 // version is stamped by the build (-ldflags -X main.version=<git sha>).

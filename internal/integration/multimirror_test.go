@@ -13,9 +13,9 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 
-	"github.com/lhns/umleitung/internal/config"
-	"github.com/lhns/umleitung/internal/imapx"
-	"github.com/lhns/umleitung/internal/mirror"
+	"github.com/lhns/umleiter/internal/config"
+	"github.com/lhns/umleiter/internal/imapx"
+	"github.com/lhns/umleiter/internal/mirror"
 )
 
 // TestMultiMirror runs two independent mirrors concurrently through

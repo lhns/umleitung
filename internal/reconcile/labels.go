@@ -5,7 +5,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 
-	"github.com/lhns/umleitung/internal/imapx"
+	"github.com/lhns/umleiter/internal/imapx"
 )
 
 // excludedAttrs disqualify a folder from being a label: unselectable and

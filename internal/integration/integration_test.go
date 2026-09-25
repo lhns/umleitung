@@ -20,10 +20,10 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 
-	"github.com/lhns/umleitung/internal/config"
-	"github.com/lhns/umleitung/internal/imapx"
-	"github.com/lhns/umleitung/internal/reconcile"
-	"github.com/lhns/umleitung/internal/state"
+	"github.com/lhns/umleiter/internal/config"
+	"github.com/lhns/umleiter/internal/imapx"
+	"github.com/lhns/umleiter/internal/reconcile"
+	"github.com/lhns/umleiter/internal/state"
 )
 
 const (

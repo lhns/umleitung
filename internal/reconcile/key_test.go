@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lhns/umleitung/internal/imapx"
+	"github.com/lhns/umleiter/internal/imapx"
 )
 
 func TestDedupKeyUsesMessageID(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lhns/umleitung/internal/config"
+	"github.com/lhns/umleiter/internal/config"
 )
 
 // scriptedServer is a minimal line-based IMAP server for protocol edge cases

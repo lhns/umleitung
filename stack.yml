@@ -8,7 +8,7 @@
 # The yaml references the secrets via password_file: /run/secrets/...
 services:
   umleiter:
-    image: ghcr.io/lhns/umleitung:latest
+    image: ghcr.io/lhns/umleiter:latest
     configs:
       - source: umleiter_config
         target: /config/umleiter.yaml

@@ -8,7 +8,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 
-	"github.com/lhns/umleitung/internal/imapx"
+	"github.com/lhns/umleiter/internal/imapx"
 )
 
 func TestKeywordForSanitization(t *testing.T) {

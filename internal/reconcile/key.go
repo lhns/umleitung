@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/lhns/umleitung/internal/imapx"
+	"github.com/lhns/umleiter/internal/imapx"
 )
 
 // synthPrefix marks dedup keys synthesized for messages without a Message-ID.

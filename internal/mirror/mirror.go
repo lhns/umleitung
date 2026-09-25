@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lhns/umleitung/internal/config"
-	"github.com/lhns/umleitung/internal/imapx"
-	"github.com/lhns/umleitung/internal/reconcile"
-	"github.com/lhns/umleitung/internal/state"
+	"github.com/lhns/umleiter/internal/config"
+	"github.com/lhns/umleiter/internal/imapx"
+	"github.com/lhns/umleiter/internal/reconcile"
+	"github.com/lhns/umleiter/internal/state"
 )
 
 // Run operates the mirror until ctx is cancelled. It owns its state store

@@ -1,7 +1,7 @@
 # Umleiter
 
-[![CI](https://github.com/lhns/umleitung/actions/workflows/ci.yml/badge.svg)](https://github.com/lhns/umleitung/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/lhns/umleitung)](https://github.com/lhns/umleitung/releases/latest)
+[![CI](https://github.com/lhns/umleiter/actions/workflows/ci.yml/badge.svg)](https://github.com/lhns/umleiter/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lhns/umleiter)](https://github.com/lhns/umleiter/releases/latest)
 
 **Keep a live copy of your mailbox on another IMAP server.**
 
@@ -65,7 +65,7 @@ copy everything into one folder instead.
 ```yaml
 services:
   umleiter:
-    image: ghcr.io/lhns/umleitung:latest
+    image: ghcr.io/lhns/umleiter:latest
     restart: unless-stopped
     volumes:
       - ./umleiter.yaml:/config/umleiter.yaml:ro
@@ -93,7 +93,7 @@ The first run copies your whole mailbox and can take a while (see
 [First run](#first-run)). After that, new mail arrives within seconds.
 
 For Docker Swarm, [`stack.yml`](stack.yml) uses Swarm configs and secrets
-instead. Pin a version with `ghcr.io/lhns/umleitung:0.1.0`.
+instead. Pin a version with `ghcr.io/lhns/umleiter:0.1.0`.
 
 ## Features
 
@@ -346,7 +346,7 @@ Design decisions are recorded in [`docs/adr/`](docs/adr/).
 
 ```sh
 go test ./...
-docker build -t umleitung .
+docker build -t umleiter .
 ```
 
 Go, built as a single static binary in a distroless image. Main libraries:

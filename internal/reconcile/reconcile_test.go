@@ -11,8 +11,8 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 
-	"github.com/lhns/umleitung/internal/imapx"
-	"github.com/lhns/umleitung/internal/state"
+	"github.com/lhns/umleiter/internal/imapx"
+	"github.com/lhns/umleiter/internal/state"
 )
 
 // ---- fakes ----
